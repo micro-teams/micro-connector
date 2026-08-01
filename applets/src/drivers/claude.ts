@@ -14,6 +14,7 @@ import {
   parseOption,
   readOptions,
   SHIFT_TAB,
+  tail as tailOf,
 } from '../engine/driver'
 import type { Choice } from '../engine/driver'
 
@@ -24,8 +25,9 @@ let modeCyclesTried = 0
 let bypassUnavailable = false
 
 function observe(screen: string): Observation {
-  const lines = screen.split('\n')
-  const tail = lines.slice(-16)
+  // Trailing blank lines are dropped before the tail is taken: a short conversation in a tall pane
+  // is mostly emptiness, and a naive last-16-lines tail would miss the footer entirely.
+  const tail = tailOf(screen, 16).split('\n')
   const tailStr = tail.join('\n')
 
   if (/Pane is dead \(status/.test(tailStr)) return { kind: 'dead' }

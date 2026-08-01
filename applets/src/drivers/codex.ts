@@ -7,7 +7,7 @@
 // abstraction that fits neither, and the failure is invisible: a screenshot of a driver that has
 // silently stopped working looks exactly like one that works.
 
-import { defineDriver, ENTER, Observation } from '../engine/driver'
+import { tail as tailOf, defineDriver, ENTER, Observation } from '../engine/driver'
 
 // The standing operator instructions. The control plane substitutes the real text for this
 // placeholder before serving the file. Codex has no system prompt, and sending these as its initial
@@ -33,7 +33,7 @@ defineDriver({
   ],
 
   observe: (screen): Observation => {
-    const tail = screen.split('\n').slice(-16)
+    const tail = tailOf(screen, 16).split('\n')
     const tailStr = tail.join('\n')
     if (/Pane is dead \(status/.test(tailStr)) return { kind: 'dead' }
     // Codex paints "esc to interrupt" only while a turn is running — the same kind of signal as

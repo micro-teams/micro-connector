@@ -138,3 +138,8 @@ test("the driver announces itself so the control plane knows what it is talking 
   assert.equal(host.calls[0].name, "screenReady");
   assert.equal(host.calls[0].args.driver, "claude");
 });
+test("a prompt near the top of a tall pane is still a prompt", () => {
+  const host = loadDriver();
+  host.frame(IDLE + "\n".repeat(20));
+  assert.equal(host.vars.status, "idle");
+});

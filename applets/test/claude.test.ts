@@ -90,3 +90,14 @@ test('the driver announces itself so the control plane knows what it is talking 
   assert.equal(host.calls[0].name, 'screenReady')
   assert.equal((host.calls[0].args as any).driver, 'claude')
 })
+
+// A short conversation in a tall pane leaves the bottom half of the grid blank. Read naively, the
+// last sixteen lines are then almost all empty and the footer is nowhere in them — so the driver
+// decides the program is still starting, forever, while a person looking at the same screen sees a
+// working prompt. Found by asserting on the driver's opinion rather than on the pane, which is the
+// whole reason the end-to-end test asks the driver what it thinks.
+test('a prompt near the top of a tall pane is still a prompt', () => {
+  const host = loadDriver()
+  host.frame(IDLE + '\n'.repeat(20))
+  assert.equal(host.vars.status, 'idle')
+})

@@ -94,7 +94,23 @@ export interface DriverSpec {
   tailLines?: number
 }
 
-const tailOf = (screen: string, n: number) => screen.split('\n').slice(-n).join('\n')
+/**
+ * The last n painted lines.
+ *
+ * "Painted" is the point: a terminal is a fixed grid, so a program with a short conversation in a
+ * tall pane leaves the bottom half blank — and a plain last-n-lines tail is then mostly emptiness
+ * with the footer pushed out of view. A driver reading that tail concludes the program has not
+ * started yet, forever, while a person looking at the same screen sees a working prompt. So trailing
+ * blank lines are dropped first, and the tail is taken from where the content actually ends.
+ */
+export function tail(screen: string, n: number): string {
+  const lines = screen.split('\n')
+  let end = lines.length
+  while (end > 0 && lines[end - 1].trim() === '') end--
+  return lines.slice(Math.max(0, end - n), end).join('\n')
+}
+
+const tailOf = tail
 
 export function defineDriver(spec: DriverSpec): void {
   const tailLines = spec.tailLines ?? 16

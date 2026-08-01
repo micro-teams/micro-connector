@@ -49,9 +49,25 @@ jobs:
           go vet ./...
           go test ./...
 
+  # The job this repository exists for. `fake` is the deterministic baseline — if it is red, we broke
+  # something. The real-Claude legs answer a different question: whether Claude Code changed under
+  # us. The pinned one is required, because pinned means it can only break when we change something;
+  # `installer` follows the latest release and is advisory, since an upstream UI change is
+  # intelligence worth having rather than a reason to block a merge.
   testbed:
-    name: testbed (control plane + connector + real tmux)
+    name: testbed (${{ matrix.leg }})
     runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - leg: fake
+            experimental: false
+          - leg: npm:2.1.220
+            experimental: false
+          - leg: installer
+            experimental: true
+    continue-on-error: ${{ matrix.experimental }}
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-node@v4
@@ -60,10 +76,10 @@ jobs:
       - uses: actions/setup-go@v5
         with:
           go-version-file: cli/go.mod
-      - name: End to end
+      - name: End to end (${{ matrix.leg }})
         run: |
           command -v tmux >/dev/null || sudo apt-get install -y -qq tmux
-          bash testbed/e2e.sh
+          bash testbed/e2e.sh "${{ matrix.leg }}"
 
   ci-success:
     name: CI success
