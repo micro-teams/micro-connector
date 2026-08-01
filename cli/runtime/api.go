@@ -18,7 +18,7 @@ func (r *Runtime) installAPI() error {
 	// __log: default logger the runtime uses; scripts reach it as <global>.log.
 	_ = vm.Set("__log", func(msg string) { log.Printf("script: %s", msg) })
 
-	microteams := vm.NewObject()
+	api := vm.NewObject()
 
 	// --- terminal (read/write) --------------------------------------------
 	term := vm.NewObject()
@@ -40,10 +40,10 @@ func (r *Runtime) installAPI() error {
 		}
 		return goja.Undefined()
 	})
-	_ = microteams.Set("term", term)
+	_ = api.Set("term", term)
 
 	// --- own: script-owned variable (script r/w, server mirrors) ----------
-	_ = microteams.Set("own", func(call goja.FunctionCall) goja.Value {
+	_ = api.Set("own", func(call goja.FunctionCall) goja.Value {
 		name := call.Argument(0).String()
 		initial := exportArg(call, 1)
 		r.owned[name] = initial
@@ -65,7 +65,7 @@ func (r *Runtime) installAPI() error {
 	})
 
 	// --- watch: server-owned variable (server r/w, script observes) -------
-	_ = microteams.Set("watch", func(call goja.FunctionCall) goja.Value {
+	_ = api.Set("watch", func(call goja.FunctionCall) goja.Value {
 		name := call.Argument(0).String()
 		if _, ok := r.watched[name]; !ok {
 			r.watched[name] = &watchedVar{}
@@ -84,7 +84,7 @@ func (r *Runtime) installAPI() error {
 	})
 
 	// --- expose: a script function the server may call --------------------
-	_ = microteams.Set("expose", func(call goja.FunctionCall) goja.Value {
+	_ = api.Set("expose", func(call goja.FunctionCall) goja.Value {
 		name := call.Argument(0).String()
 		if fn, ok := goja.AssertFunction(call.Argument(1)); ok {
 			r.exposed[name] = fn
@@ -93,7 +93,7 @@ func (r *Runtime) installAPI() error {
 	})
 
 	// --- call: invoke a server function, returns a Promise ----------------
-	_ = microteams.Set("call", func(call goja.FunctionCall) goja.Value {
+	_ = api.Set("call", func(call goja.FunctionCall) goja.Value {
 		name := call.Argument(0).String()
 		args := make([]any, 0, len(call.Arguments)-1)
 		for _, a := range call.Arguments[1:] {
@@ -107,16 +107,16 @@ func (r *Runtime) installAPI() error {
 		return vm.ToValue(p)
 	})
 
-	_ = microteams.Set("log", func(msg string) { log.Printf("script: %s", msg) })
+	_ = api.Set("log", func(msg string) { log.Printf("script: %s", msg) })
 
 	// The applet reaches the host through one global. Its canonical name is neutral, because the
 	// same built applet has to run under every product that embeds this connector; the brand's own
 	// name is installed as an alias so applets written against a specific product keep working.
-	if err := vm.Set("connector", microteams); err != nil {
+	if err := vm.Set("connector", api); err != nil {
 		return err
 	}
 	if n := brand.Current.Name; n != "" && n != "connector" {
-		if err := vm.Set(n, microteams); err != nil {
+		if err := vm.Set(n, api); err != nil {
 			return err
 		}
 	}

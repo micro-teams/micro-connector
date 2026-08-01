@@ -27,19 +27,19 @@ type Manager struct {
 	conf string
 }
 
-// findTmux prefers a private tmux owned by this installation over whatever the
-// host system happens to have: $MICROTEAMS_TMUX, then <user-config>/microteams/bin/tmux
-// (placed there by an installer), then PATH as a last resort. This keeps the
-// CLI self-contained — a machine without tmux works once the installer drops
-// one in, and a machine with a quirky system tmux is never at its mercy.
+// findTmux prefers a private tmux owned by this installation over whatever the host system happens
+// to have: the brand's own TMUX variable, then <user-config>/<brand>/bin/tmux (placed there by an
+// installer), then PATH as a last resort. This keeps the connector self-contained — a machine
+// without tmux works once the installer drops one in, and a machine with a quirky system tmux is
+// never at its mercy.
 func findTmux() (string, error) {
-	if p := os.Getenv("MICROTEAMS_TMUX"); p != "" {
+	if p := brand.Current.Getenv("TMUX"); p != "" {
 		if _, err := os.Stat(p); err == nil {
 			return p, nil
 		}
 	}
 	if base, err := os.UserConfigDir(); err == nil {
-		p := filepath.Join(base, "microteams", "bin", "tmux")
+		p := filepath.Join(base, brand.Current.ConfigDir, "bin", "tmux")
 		if _, err := os.Stat(p); err == nil {
 			return p, nil
 		}
@@ -47,7 +47,7 @@ func findTmux() (string, error) {
 	if p, err := exec.LookPath("tmux"); err == nil {
 		return p, nil
 	}
-	return "", fmt.Errorf("terminal: no tmux found (install one, or place a private copy at <config>/microteams/bin/tmux)")
+	return "", fmt.Errorf("terminal: no tmux found (install one, or place a private copy at <config>/%s/bin/tmux)", brand.Current.ConfigDir)
 }
 
 // NewManager locates tmux and provisions a private, short-path socket dir. It
@@ -61,8 +61,8 @@ func NewManager() (*Manager, error) {
 		return nil, err
 	}
 	// A STABLE per-user runtime dir — NOT a fresh MkdirTemp each start. The tmux
-	// server daemonizes and outlives the microteams process; a restarted or self-updated
-	// (syscall.Exec) microteams must reconnect to the SAME socket to find and re-adopt the
+	// server daemonizes and outlives the connector process; a restarted or self-updated
+	// (syscall.Exec) connector must reconnect to the SAME socket to find and re-adopt the
 	// surviving sessions. A random dir per process would strand them on an orphan
 	// socket (which is exactly what broke in-place update before this).
 	dir := brand.Current.RuntimePath()
