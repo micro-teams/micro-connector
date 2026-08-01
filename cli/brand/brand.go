@@ -30,8 +30,12 @@ type Brand struct {
 	// differ between products: two connectors sharing it would each see the other's sessions, and
 	// tearing one down would take the other's screens with it.
 	RuntimeDir string
-	// ServiceName is the system service's name.
+	// ServiceName is the system service's name. It must not drift: uninstalling by the wrong name
+	// stops nothing and reports success.
 	ServiceName string
+	// ServiceDisplayName and ServiceDescription are what a person reads in their init system.
+	ServiceDisplayName string
+	ServiceDescription string
 	// EnrollBase is the control plane's enrollment path, e.g. "/machine/enroll", under which
 	// "/start" and "/poll" live.
 	EnrollBase string
@@ -45,13 +49,15 @@ type Brand struct {
 // product: a connector that forgot to say who it is should look obviously unconfigured rather than
 // quietly borrow another product's socket and config.
 var Current = Brand{
-	Name:        "connector",
-	EnvPrefix:   "CONNECTOR",
-	ConfigDir:   "connector",
-	RuntimeDir:  "connector",
-	ServiceName: "connector",
-	EnrollBase:  "/machine/enroll",
-	BinaryBase:  "/connector/latest",
+	Name:               "connector",
+	EnvPrefix:          "CONNECTOR",
+	ConfigDir:          "connector",
+	RuntimeDir:         "connector",
+	ServiceName:        "connector",
+	ServiceDisplayName: "Connector",
+	ServiceDescription: "Connects this machine to its control plane.",
+	EnrollBase:         "/machine/enroll",
+	BinaryBase:         "/connector/latest",
 }
 
 // Env returns a full environment variable name, e.g. Env("TOKEN") -> "MICROTEAMS_TOKEN".

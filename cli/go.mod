@@ -5,6 +5,7 @@ go 1.25.0
 require (
 	github.com/creack/pty v1.1.24
 	github.com/dop251/goja v0.0.0-20260723142020-b4aef50fa347
+	github.com/kardianos/service v1.3.0
 	github.com/spf13/cobra v1.10.2
 )
 
@@ -14,5 +15,6 @@ require (
 	github.com/google/pprof v0.0.0-20230207041349-798e818bf904 // indirect
 	github.com/inconshreveable/mousetrap v1.1.0 // indirect
 	github.com/spf13/pflag v1.0.9 // indirect
+	golang.org/x/sys v0.34.0 // indirect
 	golang.org/x/text v0.3.8 // indirect
 )
