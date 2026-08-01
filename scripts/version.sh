@@ -35,7 +35,9 @@ VERSION_FILE="$ROOT/VERSION"
 APPLETS_PKG="$ROOT/applets/package.json"
 GO_VERSION="$ROOT/cli/version.go"
 
-semver_re='^[0-9]+\.[0-9]+\.[0-9]+$'
+# Prereleases are allowed and are how a version is offered before it is promised: 0.1.0-rc1 ships
+# under its own npm dist-tag (`rc`), and Go will not select it unless a consumer asks by name.
+semver_re='^[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.]+)?$'
 read_current() { tr -d '[:space:]' < "$VERSION_FILE"; }
 
 pkg_version() { node -p "require('$APPLETS_PKG').version" 2>/dev/null || echo "(node unavailable)"; }
