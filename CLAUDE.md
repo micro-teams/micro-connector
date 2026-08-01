@@ -56,6 +56,11 @@ The `cli/` prefix is Go's rule for a module in a subdirectory, not a preference.
 `main` also publishes `<version>-main.<run>` under the `dev` dist-tag, so head is installable
 without anyone getting it by accident.
 
+A prerelease (`0.1.0-rc1`) is how a version is offered before it is promised. It publishes under its
+own dist-tag taken from the prerelease id — `rc`, never `latest`, because `npm install` with no
+version asks for `latest` and would hand a candidate to everyone who was not asking for one. Go
+behaves the same way by itself: it will not resolve a prerelease unless a consumer names it.
+
 **Numbers this script deliberately does not touch**, because they answer different questions and
 moving them with a release would be a lie:
 

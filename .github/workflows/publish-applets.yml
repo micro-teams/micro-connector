@@ -62,7 +62,16 @@ jobs:
               exit 1
             }
             echo "version=$BASE" >> "$GITHUB_OUTPUT"
-            echo "dist_tag=latest" >> "$GITHUB_OUTPUT"
+            # A prerelease must never take the `latest` tag: `npm install` with no version asks for
+            # `latest`, so a release candidate published there is installed by everyone who was not
+            # asking for one. Its dist-tag comes from its own prerelease id — 0.1.0-rc1 goes out as
+            # `rc`, and someone who wants it says so.
+            if [[ "$BASE" == *-* ]]; then
+              PRE="${BASE#*-}"; PRE="${PRE%%.*}"
+              echo "dist_tag=${PRE:-next}" >> "$GITHUB_OUTPUT"
+            else
+              echo "dist_tag=latest" >> "$GITHUB_OUTPUT"
+            fi
           else
             echo "version=$BASE-main.${GITHUB_RUN_NUMBER}" >> "$GITHUB_OUTPUT"
             echo "dist_tag=dev" >> "$GITHUB_OUTPUT"
