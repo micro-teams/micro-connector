@@ -29,10 +29,14 @@ drives a **real Claude Code** against a mock model rather than a fake program ag
 
 ```
 applets/    the screen engine + per-program declarations (claude, codex), built to JS
-cli/        the Go library: terminal, runtime, session lifecycle, primitives  (in progress)
-testbed/    a small reference control plane — the executable half of the contract  (planned)
+cli/        the Go library: terminal, runtime, screens, enrolment, credentials, self-update
+testbed/    a reference control plane, a connector made only of the library, and their e2e
+docs/       the contract between a control plane and a connector
 .github/    the tests: real tmux, real Claude Code, mock model, matrixed by version
 ```
+
+Implementing a control plane? [`docs/protocol.md`](docs/protocol.md) is the specification, and
+[`testbed/server.py`](testbed/server.py) is the same thing you can run.
 
 ## Status
 
@@ -41,9 +45,8 @@ that is where the value is concentrated: `applets/src/engine` is the shared mach
 `applets/src/drivers/*.ts` are one declaration per program. The Go library, the reference control
 plane and the end-to-end tests follow, in that order.
 
-The protocol between a connector and a control plane will be specified here, in this repository,
-once it is extracted rather than merely implied — a specification that lives somewhere else is not
-one this repository's readers can hold it to.
+The protocol between a connector and a control plane is specified in
+[`docs/protocol.md`](docs/protocol.md), with a runnable reference implementation beside it.
 
 ## License
 
