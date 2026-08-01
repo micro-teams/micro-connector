@@ -37,6 +37,37 @@ they share a skeleton, not their gates.
 
 Build output is a self-contained IIFE per driver, because that is what a goja VM is handed.
 
+## Versions
+
+`VERSION` at the repository root is the single source of truth, and `scripts/version.sh` is the only
+thing that writes it anywhere else. Run it with no arguments to read the current version and check
+that every file agrees; with an `X.Y.Z` to set it; with `--tags` to print the commands that release
+it.
+
+Two artifacts ship from here and they are versioned **together**, because a screen driver and the
+host that runs it are only ever tested as a pair:
+
+| | published as | released by |
+|---|---|---|
+| applets | `@micro-teams/connector-applets` on GitHub Packages | tag `applets-v<version>` |
+| Go library | `github.com/micro-teams/micro-connector/cli` | tag `cli/v<version>` |
+
+The `cli/` prefix is Go's rule for a module in a subdirectory, not a preference. Every merge to
+`main` also publishes `<version>-main.<run>` under the `dev` dist-tag, so head is installable
+without anyone getting it by accident.
+
+**Numbers this script deliberately does not touch**, because they answer different questions and
+moving them with a release would be a lie:
+
+- `protocol.Version` — the wire version. It changes when the message set changes in a way an older
+  peer cannot survive, which is rarer than a release and must stay legible on its own.
+- the pinned Claude Code in CI, the MockServer image, the Go toolchain — third-party versions we
+  chose to sit on.
+
+When you add something that carries the version, add it to the script's read/verify list too. A
+version file that some artifacts quietly ignore is worse than no version file, because it is
+believed.
+
 ## Style
 
 Comments explain **why**, especially when the code looks odd — the odd-looking code here is usually
