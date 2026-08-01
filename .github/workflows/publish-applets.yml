@@ -1,0 +1,82 @@
+name: Publish applets
+
+# The screen drivers are the part of this repository that goes stale fastest — every Claude Code
+# release can change a dialog — so they are published rather than copied. A consumer takes a fix by
+# upgrading a dependency, not by remembering to rebuild something.
+#
+# Two kinds of publish, on purpose:
+#
+#   main            <version>-main.<run> under the `dev` tag. Every merge is installable, and
+#                   nobody gets it by accident: a plain `npm install` still resolves to the last
+#                   released version.
+#   tag applets-v*  that exact version, under `latest`. Cutting a release is pushing a tag.
+#
+# GITHUB_TOKEN is enough for GitHub Packages when the scope matches the repository owner, so this
+# needs no secret anyone has to create or rotate.
+
+on:
+  push:
+    branches: ["main"]
+    tags: ["applets-v*"]
+  workflow_dispatch:
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    defaults:
+      run:
+        working-directory: applets
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+          registry-url: "https://npm.pkg.github.com"
+          scope: "@micro-teams"
+
+      - name: Install
+        run: npm ci || npm install
+
+      # Never publish a driver that has not been checked: a broken screen driver does not fail
+      # loudly on a machine, it just quietly stops understanding what it is looking at.
+      - name: Check
+        run: |
+          npm run typecheck
+          npm test
+
+      - name: Build
+        run: npm run build
+
+      - name: Decide the version
+        id: v
+        run: |
+          set -euo pipefail
+          BASE="$(node -p "require('./package.json').version")"
+          if [[ "${GITHUB_REF}" == refs/tags/applets-v* ]]; then
+            TAGGED="${GITHUB_REF#refs/tags/applets-v}"
+            [ "$TAGGED" = "$BASE" ] || {
+              echo "tag applets-v$TAGGED does not match package.json version $BASE" >&2
+              exit 1
+            }
+            echo "version=$BASE" >> "$GITHUB_OUTPUT"
+            echo "dist_tag=latest" >> "$GITHUB_OUTPUT"
+          else
+            echo "version=$BASE-main.${GITHUB_RUN_NUMBER}" >> "$GITHUB_OUTPUT"
+            echo "dist_tag=dev" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Publish ${{ steps.v.outputs.version }} (${{ steps.v.outputs.dist_tag }})
+        run: |
+          set -euo pipefail
+          npm version --no-git-tag-version --allow-same-version "${{ steps.v.outputs.version }}"
+          npm publish --tag "${{ steps.v.outputs.dist_tag }}"
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Say what was published
+        run: |
+          echo "published @micro-teams/connector-applets@${{ steps.v.outputs.version }}" \
+               "under the ${{ steps.v.outputs.dist_tag }} tag" >> "$GITHUB_STEP_SUMMARY"

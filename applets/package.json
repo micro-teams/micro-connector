@@ -1,6 +1,6 @@
 {
   "name": "@micro-teams/connector-applets",
-  "version": "0.0.1",
+  "version": "0.1.0",
   "private": false,
   "license": "MIT",
   "description": "Screen engine and program declarations (Claude Code, Codex) for micro-connector",
@@ -15,5 +15,18 @@
     "@types/node": "^26.1.2",
     "esbuild": "^0.25.0",
     "typescript": "^5.6.0"
-  }
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/micro-teams/micro-connector.git",
+    "directory": "applets"
+  },
+  "publishConfig": {
+    "registry": "https://npm.pkg.github.com"
+  },
+  "files": [
+    "dist",
+    "README.md"
+  ],
+  "main": "dist/claude.js"
 }
