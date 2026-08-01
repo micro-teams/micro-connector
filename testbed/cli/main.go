@@ -9,16 +9,15 @@ package main
 
 import (
 	"context"
-	"encoding/json"
 	"flag"
 	"fmt"
 	"net/http"
 	"os"
 	"os/signal"
-	"strings"
 	"syscall"
 	"time"
 
+	"github.com/micro-teams/micro-connector/cli/auth"
 	"github.com/micro-teams/micro-connector/cli/brand"
 	"github.com/micro-teams/micro-connector/cli/screen"
 	"github.com/micro-teams/micro-connector/cli/terminal"
@@ -41,11 +40,16 @@ func main() {
 		BinaryBase:  "/connector/latest",
 	}
 
-	machineID, token, err := enroll(*base)
+	// Enrolment comes from the library: a product should not be writing its own two-step handshake,
+	// and this test connector deliberately uses the same one MicroTeams does.
+	res, err := auth.Login(context.Background(), *base, func(url string) {
+		fmt.Println("approve at:", url)
+	})
 	if err != nil {
 		fmt.Fprintln(os.Stderr, "enroll:", err)
 		os.Exit(1)
 	}
+	machineID, token := res.MachineID, res.Token
 	fmt.Println("enrolled as", machineID)
 
 	tm, err := terminal.NewManager()
@@ -65,48 +69,4 @@ func main() {
 	defer tm.KillServer()
 	fmt.Println("connected; waiting for the control plane")
 	_ = conn.Run(ctx, mgr.Dispatch)
-}
-
-// enroll walks the two-step exchange: ask, then wait to be approved. A real product would show the
-// code to a human here; this one just waits.
-func enroll(base string) (machineID, token string, err error) {
-	var start struct {
-		PollToken string `json:"pollToken"`
-	}
-	if err = postJSON(base+brand.Current.EnrollBase+"/start", map[string]any{}, &start); err != nil {
-		return "", "", err
-	}
-	deadline := time.Now().Add(30 * time.Second)
-	for time.Now().Before(deadline) {
-		var poll struct {
-			Status    string `json:"status"`
-			MachineID string `json:"machineId"`
-			Token     string `json:"token"`
-		}
-		if err = postJSON(base+brand.Current.EnrollBase+"/poll",
-			map[string]any{"pollToken": start.PollToken}, &poll); err != nil {
-			return "", "", err
-		}
-		if poll.Status == "approved" {
-			return poll.MachineID, poll.Token, nil
-		}
-		time.Sleep(time.Second)
-	}
-	return "", "", fmt.Errorf("enrolment was never approved")
-}
-
-func postJSON(url string, body any, out any) error {
-	b, err := json.Marshal(body)
-	if err != nil {
-		return err
-	}
-	resp, err := http.Post(url, "application/json", strings.NewReader(string(b)))
-	if err != nil {
-		return err
-	}
-	defer resp.Body.Close()
-	if resp.StatusCode >= 300 {
-		return fmt.Errorf("%s: %s", url, resp.Status)
-	}
-	return json.NewDecoder(resp.Body).Decode(out)
 }

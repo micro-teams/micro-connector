@@ -9,7 +9,7 @@ it cannot drift into being a description of a contract nobody speaks.
 Python standard library only, on purpose: a specification you need to install something to read is
 one people will read less.
 
-  POST /machine/enroll/start           -> {"code": ..., "pollToken": ...}
+  POST /machine/enroll/start           -> {"code": ..., "approveUrl": ..., "interval": ...}
   POST /machine/enroll/poll            -> {"status": "approved", "machineId": ..., "token": ...}
   GET  /bus/inbox?machine=<id>         -> [ ...messages for the machine... ]   (long poll)
   POST /bus/outbox?machine=<id>        <- one message from the machine
@@ -103,8 +103,11 @@ class Handler(BaseHTTPRequestHandler):
         # ("Unsupported method") points nowhere near the cause.
         body = self._read_json()
         if path == "/machine/enroll/start":
+            # The shape the connector's own enrolment expects: a code to show, a link for whoever
+            # approves it, and how often to poll.
             code = uuid.uuid4().hex[:6].upper()
-            return self._send({"code": code, "pollToken": code, "verifyUrl": "(auto-approved)"})
+            return self._send({"code": code, "approveUrl": f"http://127.0.0.1:{PORT}/approve/{code}",
+                               "interval": 1})
         if path == "/machine/enroll/poll":
             # A real control plane waits for a human or a tenant to approve. The reference one
             # approves immediately: what is being specified here is the shape of the exchange, not
