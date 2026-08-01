@@ -1,0 +1,40 @@
+name: CI
+
+on:
+  push:
+    branches: ["main"]
+  pull_request:
+    branches: ["main"]
+  workflow_dispatch:
+
+# What is worth testing here is not that the code compiles — it is that the drivers still understand
+# the screens they are pointed at. That is why the interesting jobs (real Claude Code against a mock
+# model, in a container with a real tmux) are the ones being built out next; see docs/.
+
+jobs:
+  applets:
+    name: applets (engine + drivers)
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: applets
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+      - run: npm ci || npm install
+      - run: npm run typecheck
+      - run: npm test
+      - name: Upload the built drivers
+        uses: actions/upload-artifact@v4
+        with:
+          name: drivers
+          path: applets/dist
+
+  ci-success:
+    name: CI success
+    needs: [applets]
+    runs-on: ubuntu-latest
+    steps:
+      - run: echo "All required CI jobs passed."
