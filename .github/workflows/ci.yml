@@ -32,9 +32,42 @@ jobs:
           name: drivers
           path: applets/dist
 
+  go:
+    name: cli (build + tests)
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: cli
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: cli/go.mod
+      - name: Test
+        run: |
+          command -v tmux >/dev/null || sudo apt-get install -y -qq tmux
+          go vet ./...
+          go test ./...
+
+  testbed:
+    name: testbed (control plane + connector + real tmux)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: cli/go.mod
+      - name: End to end
+        run: |
+          command -v tmux >/dev/null || sudo apt-get install -y -qq tmux
+          bash testbed/e2e.sh
+
   ci-success:
     name: CI success
-    needs: [applets]
+    needs: [applets, go, testbed]
     runs-on: ubuntu-latest
     steps:
       - run: echo "All required CI jobs passed."
