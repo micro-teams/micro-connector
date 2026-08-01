@@ -32,13 +32,18 @@ applets/    the screen engine + per-program declarations (claude, codex), built 
 cli/        the Go library: terminal, runtime, session lifecycle, primitives  (in progress)
 testbed/    a small reference control plane — the executable half of the contract  (planned)
 .github/    the tests: real tmux, real Claude Code, mock model, matrixed by version
-docs/       contract and design
 ```
 
 ## Status
 
-Early. The screen engine is being extracted from MicroTeams' two production drivers first, because
-that is where the value is concentrated. See [`docs/`](docs/).
+Early. The screen engine has been extracted from MicroTeams' two production drivers first, because
+that is where the value is concentrated: `applets/src/engine` is the shared machinery and
+`applets/src/drivers/*.ts` are one declaration per program. The Go library, the reference control
+plane and the end-to-end tests follow, in that order.
+
+The protocol between a connector and a control plane will be specified here, in this repository,
+once it is extracted rather than merely implied — a specification that lives somewhere else is not
+one this repository's readers can hold it to.
 
 ## License
 
