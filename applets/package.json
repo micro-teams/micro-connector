@@ -1,6 +1,6 @@
 {
   "name": "@micro-teams/connector-applets",
-  "version": "0.1.0-rc1",
+  "version": "0.1.0",
   "private": false,
   "license": "MIT",
   "description": "Screen engine and program declarations (Claude Code, Codex) for micro-connector",

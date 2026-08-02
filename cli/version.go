@@ -8,4 +8,4 @@ package cli
 // Not to be confused with protocol.Version, which is the WIRE version: that one changes when the
 // message set changes in a way an older peer cannot survive, which is a rarer event than a release
 // and deliberately tracked separately.
-const Version = "0.1.0-rc1"
+const Version = "0.1.0"
