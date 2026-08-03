@@ -38,15 +38,50 @@ docs/       the contract between a control plane and a connector
 Implementing a control plane? [`docs/protocol.md`](docs/protocol.md) is the specification, and
 [`testbed/server.py`](testbed/server.py) is the same thing you can run.
 
+## Using it
+
+Two artifacts, versioned together, because a screen driver and the host that runs it are only ever
+tested as a pair.
+
+**The Go library** — build a connector for your own product:
+
+```bash
+go get github.com/micro-teams/micro-connector/cli@v0.1.0
+```
+
+```go
+brand.Current = brand.Brand{Name: "yourthing", EnvPrefix: "YOURTHING", /* … */}
+
+tm, _ := terminal.NewManager()
+conn := ws.New(controlURL, token, apiBase)      // or httppoll, for a one-shot command
+mgr := screen.NewManager(ctx, conn, tm)
+_ = conn.Run(ctx, mgr.Dispatch)
+```
+
+`testbed/cli` is a complete working connector in 72 lines, and exists to keep that claim honest.
+
+**The screen drivers** — serve them from your control plane:
+
+```bash
+npm install @micro-teams/connector-applets@0.1.0
+```
+
+The package is published to GitHub Packages, so your `.npmrc` needs
+`@micro-teams:registry=https://npm.pkg.github.com`. Serve `dist/claude.js` (or `codex.js`) to a
+connector as a screen's applet; it is the same file this repository's CI drives a real Claude Code
+with.
+
 ## Status
 
-Early. The screen engine has been extracted from MicroTeams' two production drivers first, because
-that is where the value is concentrated: `applets/src/engine` is the shared machinery and
-`applets/src/drivers/*.ts` are one declaration per program. The Go library, the reference control
-plane and the end-to-end tests follow, in that order.
+0.1.0. One product — MicroTeams — is built on it and runs it in production, with its own end-to-end
+tests over the top; a second (CCProxy) is starting. Being 0.x, interfaces may still move: the
+driver-declaration shape is the most likely to, once a second consumer's needs are real rather than
+anticipated.
 
-The protocol between a connector and a control plane is specified in
-[`docs/protocol.md`](docs/protocol.md), with a runnable reference implementation beside it.
+The **wire protocol** is versioned separately and is at **1**. It changes only when an older peer
+could not survive the message set, which is rarer than a release — see
+[`docs/protocol.md`](docs/protocol.md), the specification, with a runnable reference implementation
+beside it in [`testbed/server.py`](testbed/server.py).
 
 ## License
 
