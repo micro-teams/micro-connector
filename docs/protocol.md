@@ -12,9 +12,12 @@ library — it already speaks all of this.
 A machine dials **out**. Nothing dials in, no port is opened, and everything below travels over one
 transport of the control plane's choosing:
 
-- a **resident connection** (MicroTeams uses a WebSocket) if screens are long-lived and the control
-  plane must reach them at any moment;
-- **HTTP polling** if the work is a single command that drives one screen and exits.
+- a **resident WebSocket** (`cli/transport/ws`) if screens are long-lived and the control plane must
+  reach them at any moment — a message can arrive whenever, so somebody has to be listening;
+- **HTTP polling** (`cli/transport/httppoll`) if the work is a single command that drives one screen
+  and exits, where a connection to maintain is a liability rather than an asset.
+
+Both are in the library, and a product picks one by handing it to the screen manager.
 
 The message set is identical either way. A transport that changes the messages is a fork, not an
 implementation.
