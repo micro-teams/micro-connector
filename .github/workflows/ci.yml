@@ -29,6 +29,7 @@ jobs:
       - name: Upload the built drivers
         uses: actions/upload-artifact@v4
         with:
+          retention-days: 1
           name: drivers
           path: applets/dist
 
