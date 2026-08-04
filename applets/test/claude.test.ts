@@ -2,7 +2,7 @@
 import { test } from 'node:test'
 import assert from 'node:assert/strict'
 import { makeHost, runDriver } from './fake-host'
-import { ENTER } from '../src/engine/keys'
+import { DOWN, ENTER } from '../src/engine/keys'
 
 const PASTE_START = '\x1b[200~'
 
@@ -100,4 +100,106 @@ test('a prompt near the top of a tall pane is still a prompt', () => {
   const host = loadDriver()
   host.frame(IDLE + '\n'.repeat(20))
   assert.equal(host.vars.status, 'idle')
+})
+
+// --- login mode ------------------------------------------------------------
+// A control plane that must log a machine IN sets the watched var `mode` to 'login'. Everything
+// below must stay dormant otherwise, so a normal agent screen is untouched.
+
+const THEME = [
+  'Choose the text style that looks best with your terminal:',
+  '',
+  '❯ 1. Dark mode',
+  '  2. Light mode',
+  '',
+  'Enter to confirm',
+].join('\n')
+
+const METHOD = [
+  'Select login method:',
+  '',
+  '❯ 1. Anthropic Console (API usage billing)',
+  '  2. Claude account with subscription',
+  '',
+  'Enter to confirm · Esc to cancel',
+].join('\n')
+
+const OAUTH = [
+  'Browser didn’t open? Use the url below to sign in:',
+  '',
+  'https://claude.ai/oauth/authorize?code=true&client_id=abc&response_type=code&state=deadbeef',
+  '',
+  'Paste code here if prompted >',
+].join('\n')
+
+function login(): ReturnType<typeof loadDriver> {
+  const host = loadDriver()
+  host.setWatched('mode', 'login')
+  return host
+}
+
+test('login mode: the theme picker is confirmed with the default', () => {
+  const host = login()
+  host.frame(THEME)
+  host.frame(THEME) // gates act every other frame
+  assert.ok(host.keys().includes(ENTER), 'a default theme is fine; confirm it')
+})
+
+test('login mode: the login-method dialog lands on subscription, never a bare Enter onto Console', () => {
+  const host = login()
+  host.clearKeys()
+  host.frame(METHOD)
+  host.frame(METHOD)
+  const typed = host.keys()
+  assert.ok(typed.includes(DOWN), 'it must step down to the subscription option, not confirm Console')
+  assert.ok(
+    !typed.startsWith(ENTER),
+    'a first-move Enter would accept "Anthropic Console" and bill per-token',
+  )
+})
+
+test('login mode: an already-onboarded idle prompt kicks off /login exactly once', () => {
+  const host = login()
+  host.frame(IDLE)
+  assert.ok(host.keys().includes('/login'), 'idle + not logged in => run /login')
+  host.clearKeys()
+  host.frame(IDLE)
+  assert.equal(host.keys(), '', 'and never again once issued')
+})
+
+test('normal mode: an idle prompt never types /login (login logic is dormant)', () => {
+  const host = loadDriver() // no mode set
+  host.frame(IDLE)
+  assert.ok(!host.keys().includes('/login'), 'a normal agent must not be driven into a login')
+})
+
+test('login mode: the OAuth URL is mirrored up and the state becomes awaitingCode', () => {
+  const host = login()
+  host.frame(OAUTH)
+  assert.equal(
+    host.vars.oauthUrl,
+    'https://claude.ai/oauth/authorize?code=true&client_id=abc&response_type=code&state=deadbeef',
+  )
+  assert.equal(host.vars.loginState, 'awaitingCode')
+})
+
+test('login mode: a captured URL survives later frames that no longer show it', () => {
+  const host = login()
+  host.frame(OAUTH)
+  host.frame(IDLE)
+  assert.ok((host.vars.oauthUrl as string).includes('oauth/authorize'), 'the URL must not blank out')
+})
+
+test('login mode: the success screen sets loginState to success', () => {
+  const host = login()
+  host.frame(OAUTH)
+  host.frame('Login successful. Press Enter to continue…')
+  assert.equal(host.vars.loginState, 'success')
+})
+
+test('normal mode: the OAuth variables stay empty', () => {
+  const host = loadDriver()
+  host.frame(OAUTH) // same screen, but no login mode
+  assert.equal(host.vars.oauthUrl, '')
+  assert.equal(host.vars.loginState, '')
 })
