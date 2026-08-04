@@ -48,7 +48,12 @@ jobs:
         run: |
           command -v tmux >/dev/null || sudo apt-get install -y -qq tmux
           go vet ./...
-          go test ./...
+          # -race, because this is the most concurrent code in the organisation and none of it was
+          # being checked for races: a screen manager dispatching from a socket goroutine into
+          # terminals, transports reconnecting underneath it, and a viewer relay reading while the
+          # program writes. A data race there does not crash — it corrupts a terminal or drops a
+          # message, months later, on someone else's machine.
+          go test -race ./...
 
   # The job this repository exists for. `fake` is the deterministic baseline — if it is red, we broke
   # something. The real-Claude legs answer a different question: whether Claude Code changed under
