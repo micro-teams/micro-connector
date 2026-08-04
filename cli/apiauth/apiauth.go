@@ -64,17 +64,32 @@ func resolveToken() string {
 	return ""
 }
 
-// Transport returns an http.RoundTripper that authenticates every request bound for the API host.
-func Transport() http.RoundTripper {
-	base := APIBase()
+// Transport returns an http.RoundTripper that authenticates every request bound for the API host,
+// sending it over the standard transport.
+func Transport() http.RoundTripper { return TransportOver(nil) }
+
+// TransportOver is Transport with the request finally issued by base rather than by the standard
+// transport. nil means http.DefaultTransport.
+//
+// The seam exists because authentication is not the only thing a product may want to do to its
+// outbound requests — one might route them over several network paths, another might record them —
+// and none of that belongs in this library. Authentication stays outermost either way, which is the
+// order that matters: this decides whether to attach a credential by looking at the host it was
+// configured for, so anything that rewrites the host has to run underneath it, and anything that
+// retries has to carry a request that is already authenticated.
+func TransportOver(base http.RoundTripper) http.RoundTripper {
+	if base == nil {
+		base = http.DefaultTransport
+	}
+	apiBase := APIBase()
 	host := ""
-	if u, err := url.Parse(base); err == nil {
+	if u, err := url.Parse(apiBase); err == nil {
 		host = u.Host
 	}
 	return &bearerInjector{
-		base:    http.DefaultTransport,
+		base:    base,
 		host:    host,
-		apiBase: base,
+		apiBase: apiBase,
 		token:   resolveToken(),
 		screen:  brand.Current.Getenv("SCREEN"),
 		exch:    ScreenExchange,
@@ -82,8 +97,11 @@ func Transport() http.RoundTripper {
 }
 
 // Client returns an http.Client that applies Transport() with a sane timeout.
-func Client() *http.Client {
-	return &http.Client{Transport: Transport(), Timeout: 30 * time.Second}
+func Client() *http.Client { return ClientOver(nil) }
+
+// ClientOver is Client over a caller-supplied base transport. See TransportOver.
+func ClientOver(base http.RoundTripper) *http.Client {
+	return &http.Client{Transport: TransportOver(base), Timeout: 30 * time.Second}
 }
 
 type bearerInjector struct {
