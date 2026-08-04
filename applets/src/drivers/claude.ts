@@ -24,6 +24,33 @@ const escapeRe = (s: string) => s.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')
 let modeCyclesTried = 0
 let bypassUnavailable = false
 
+// Login mode. A control plane that must log a fresh machine IN — rather than launch one that is
+// already authenticated — sets the watched variable `mode` to 'login'. Everything below keys off
+// that: the theme/method gates, the /login kick, and the OAuth-URL / login-state extraction all lie
+// dormant unless login mode is on, so a normal agent screen is completely unaffected. The hard part
+// of driving Claude's login lives here, once, instead of in each product's backend as scraped regex.
+const modeVar = host.watch<string>('mode')
+const inLoginMode = () => modeVar.get() === 'login'
+
+// Per-screen login progress (a fresh VM per screen resets these, which is exactly right).
+let loginIssued = false
+let capturedUrl = ''
+
+// Claude prints an authorize URL on claude.ai/claude.com; match any https URL containing "oauth" so
+// we do not couple to a host. Box-drawing and quotes are never part of it.
+const OAUTH_URL_RE = /https:\/\/[^\s│╭╮╰╯"']*oauth[^\s│╭╮╰╯"']*/i
+function findOAuthUrl(screen: string): string {
+  const flat = screen.replace(/[│╭╮╰╯]/g, '')
+  // Primary path: the control plane opens the login screen wide enough that the URL is one row, so a
+  // straight match sees it whole. Fallback: a wrapped URL — a hard wrap inserts a newline (not a
+  // space), so rejoining rows reconstructs it; imperfect if text follows on the next row, which is
+  // why width is the real fix.
+  const direct = flat.match(OAUTH_URL_RE)
+  if (direct) return direct[0]
+  const joined = flat.replace(/\n/g, '').match(OAUTH_URL_RE)
+  return joined ? joined[0] : ''
+}
+
 function observe(screen: string): Observation {
   // Trailing blank lines are dropped before the tail is taken: a short conversation in a tall pane
   // is mostly emptiness, and a naive last-16-lines tail would miss the footer entirely.
@@ -90,7 +117,7 @@ function observe(screen: string): Observation {
 
 defineDriver({
   name: 'claude',
-  version: 14,
+  version: 15,
 
   gates: [
     {
@@ -123,11 +150,36 @@ defineDriver({
         /❯\s*\d+\.\s/.test(clean(c.screen)),
       act: (c) => c.choose(/resume full session/i),
     },
+    {
+      // First-run wizard, step one: the terminal theme. Any theme is fine, so confirm the default —
+      // a bare Enter is safe here because the cursor starts on option 1 and this only picks a colour.
+      // Login mode only: a normal agent never sees this (its onboarding is pre-written).
+      name: 'login: theme picker',
+      when: (c) => inLoginMode() && /choose the text style|text style that looks|dark mode/i.test(c.screen),
+      act: (c) => c.write(ENTER),
+    },
+    {
+      // First-run wizard, step two: how to log in. We MUST land on the subscription option (the whole
+      // point is a plan login, never Console/API pay-per-token), so pick it BY LABEL — never a bare
+      // Enter, which would take whatever the build happens to default to. On known builds option 1 is
+      // the subscription one, so if the label has moved we fall back to the default rather than hang.
+      name: 'login: choose subscription login',
+      when: (c) =>
+        inLoginMode() &&
+        /login method|select login|how would you like to (log|sign) in|log in with your/i.test(c.screen),
+      act: (c) => {
+        const sub = readOptions(c.screen).find((o) =>
+          /subscription|claude account|claude\.ai|with your (claude|max|pro)|\bmax\b|\bpro\b/i.test(o.opt.label),
+        )
+        if (sub) c.choose(new RegExp(escapeRe(sub.opt.label)))
+        else c.write(ENTER)
+      },
+    },
   ],
 
   observe,
 
-  vars: { compact: '', compactPct: 0, subagents: 0 },
+  vars: { compact: '', compactPct: 0, subagents: 0, oauthUrl: '', loginState: '' },
 
   report: (ctx, vars, o) => {
     vars.subagents.set(o.kind === 'open' ? ((o as any).bandRows ?? 0) : 0)
@@ -141,6 +193,20 @@ defineDriver({
     } else {
       vars.compact.set('')
       vars.compactPct.set(0)
+    }
+
+    // Login mode: mirror the OAuth URL and the login state up so the control plane can show the URL
+    // to its operator and know when the code is wanted / the login has landed. Nothing here fires in
+    // a normal screen, so the two extra variables simply stay empty.
+    if (inLoginMode()) {
+      if (!capturedUrl) {
+        const u = findOAuthUrl(ctx.screen)
+        if (u) capturedUrl = u
+      }
+      vars.oauthUrl.set(capturedUrl)
+      if (/login successful|logged in|successfully logged/i.test(ctx.tail)) vars.loginState.set('success')
+      else if (capturedUrl) vars.loginState.set('awaitingCode')
+      else vars.loginState.set('')
     }
   },
 
@@ -162,6 +228,23 @@ defineDriver({
   // passes without it appearing (it can be disabled) settle for auto. Only act while a mode line is
   // actually on screen, so a transient frame cannot cycle away from a good mode.
   onIdle: (ctx) => {
+    // Login mode: an ALREADY-onboarded machine lands at the main prompt, not logged in — kick off
+    // /login once. A fresh machine never reaches here: its theme/method screens are dialogs the gates
+    // answer, after which OAuth auto-starts. Stop once a URL is seen so the idle prompt that appears
+    // AFTER a successful login is not mistaken for "log in again". (Same one-shot text+Enter shape as
+    // the compact command — a typed slash command does not need the paste's deferred submit.)
+    if (inLoginMode()) {
+      // Not if a URL is already on screen this very frame: report() captures it just after onIdle, so
+      // without this check a /login would be typed straight into the code prompt.
+      const urlNow = capturedUrl || findOAuthUrl(ctx.screen)
+      if (!loginIssued && !urlNow) {
+        ctx.write('/login')
+        ctx.write(ENTER)
+        loginIssued = true
+      }
+      return
+    }
+
     const inBypass = /bypass permissions on/i.test(ctx.tail)
     const inAuto = /auto mode on/i.test(ctx.tail)
     const modeVisible = inBypass || inAuto || /(accept edits|manual mode|plan mode) on/i.test(ctx.tail)
@@ -192,6 +275,16 @@ defineDriver({
     compact: () => {
       host.term.write('/compact')
       host.term.write(ENTER)
+      return true
+    },
+    // Start the interactive login explicitly, for a control plane that would rather drive it than
+    // wait for the idle kick (e.g. after re-pointing settings at the official endpoint). Same shape
+    // as compact. Submit the captured OAuth code with the ordinary `say` — a bracketed paste with a
+    // deferred Enter is exactly what a pasted code needs, and it is already the engine's blessed path.
+    login: () => {
+      host.term.write('/login')
+      host.term.write(ENTER)
+      loginIssued = true
       return true
     },
   },
