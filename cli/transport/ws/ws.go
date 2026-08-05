@@ -37,11 +37,31 @@ const (
 
 var _ protocol.Transport = (*Conn)(nil)
 
+// Options lets a product decide where each attempt goes, and learn how it went.
+//
+// The library keeps the reconnect loop — backoff, heartbeats, the meaning of a drop — because that
+// is about the protocol. Which of several public routes to dial is not: it is a fact about a
+// deployment, and a product that has more than one route needs to choose per attempt and to know
+// which attempts held, so it can stop choosing a route that accepts the handshake and then drops
+// it. Left zero, this behaves exactly as it always did.
+type Options struct {
+	// ChooseURL supplies the URL for the next attempt. nil means the URL given to New, every time.
+	ChooseURL func() string
+	// Report is told how an attempt went: the URL dialled, how long the connection was held (zero
+	// if the dial itself failed), and the error if there was one.
+	//
+	// "How long it was held" rather than "did it connect", because those differ in the case that
+	// matters: a route that completes the handshake and severs the connection a second later looks
+	// like a success on every attempt, and a client that believed it would reconnect to it forever.
+	Report func(url string, held time.Duration, err error)
+}
+
 // Conn maintains the dial-out websocket to the control plane.
 type Conn struct {
 	url    string
 	token  string
 	origin string // the API base we dialed, reported so the server can echo it to our screens
+	opts   Options
 
 	mu      sync.Mutex
 	conn    *websocket.Conn
@@ -52,7 +72,16 @@ type Conn struct {
 // reached the control plane on (which endpoint it chose); the control plane echoes it back to the
 // screens it opens here, so a screen never has to assume its own control plane's address.
 func New(url, token, origin string) *Conn {
-	return &Conn{url: url, token: token, origin: origin}
+	return NewWithOptions(url, token, origin, Options{})
+}
+
+// NewWithOptions is New with a product's own choice of route per attempt. See Options.
+//
+// origin stays what the caller passed regardless of which URL an attempt uses: it is the canonical
+// address a screen should reach its control plane on, not a record of which route this process
+// happens to be dialling at the moment.
+func NewWithOptions(url, token, origin string, opts Options) *Conn {
+	return &Conn{url: url, token: token, origin: origin, opts: opts}
 }
 
 // Run dials and pumps messages to onMsg until ctx is cancelled, reconnecting
@@ -67,7 +96,21 @@ func (c *Conn) Run(ctx context.Context, onMsg func(protocol.Msg)) error {
 		if ctx.Err() != nil {
 			return ctx.Err()
 		}
-		connected := c.runOnce(ctx, onMsg)
+		target := c.url
+		if c.opts.ChooseURL != nil {
+			if chosen := c.opts.ChooseURL(); chosen != "" {
+				target = chosen
+			}
+		}
+		started := time.Now()
+		connected, err := c.runOnce(ctx, target, onMsg)
+		if c.opts.Report != nil {
+			held := time.Duration(0)
+			if connected {
+				held = time.Since(started)
+			}
+			c.opts.Report(target, held, err)
+		}
 		if ctx.Err() != nil {
 			return ctx.Err()
 		}
@@ -86,7 +129,11 @@ func (c *Conn) Run(ctx context.Context, onMsg func(protocol.Msg)) error {
 	}
 }
 
-func (c *Conn) runOnce(ctx context.Context, onMsg func(protocol.Msg)) (connected bool) {
+func (c *Conn) runOnce(
+	ctx context.Context,
+	url string,
+	onMsg func(protocol.Msg),
+) (connected bool, err error) {
 	header := http.Header{}
 	if c.token != "" {
 		header.Set("X-Microteams-Session", c.token)
@@ -94,9 +141,9 @@ func (c *Conn) runOnce(ctx context.Context, onMsg func(protocol.Msg)) (connected
 	if c.origin != "" {
 		header.Set("X-Microteams-Origin", c.origin)
 	}
-	conn, _, err := websocket.DefaultDialer.DialContext(ctx, c.url, header)
+	conn, _, err := websocket.DefaultDialer.DialContext(ctx, url, header)
 	if err != nil {
-		return false
+		return false, err
 	}
 	defer conn.Close()
 
@@ -126,7 +173,7 @@ func (c *Conn) runOnce(ctx context.Context, onMsg func(protocol.Msg)) (connected
 	for {
 		_, data, err := conn.ReadMessage()
 		if err != nil {
-			return true
+			return true, err
 		}
 		_ = conn.SetReadDeadline(time.Now().Add(pongWait))
 		var m protocol.Msg
