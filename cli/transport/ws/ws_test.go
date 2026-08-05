@@ -140,3 +140,45 @@ func TestTheReportDistinguishesAFailedDialFromADroppedConnection(t *testing.T) {
 		t.Errorf("the report names the wrong url: %q", reports[1].url)
 	}
 }
+
+// Reconnect is the difference between "choose again" and "stop", and the difference matters more
+// here than the code suggests: stopping the process is what kills the screens a machine hosts, so
+// forcing a new attempt must never mean restarting anything.
+func TestReconnectDialsAgainWithoutStopping(t *testing.T) {
+	only, dialled := server(t, time.Hour) // holds the connection open until told otherwise
+
+	conn := New(only, "token", "https://api.example")
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	done := make(chan struct{})
+	go func() { _ = conn.Run(ctx, func(protocol.Msg) {}); close(done) }()
+
+	// Wait for the first connection, then ask for another.
+	for i := 0; i < 50 && dialled() == 0; i++ {
+		time.Sleep(20 * time.Millisecond)
+	}
+	if dialled() == 0 {
+		t.Fatal("never connected in the first place")
+	}
+	conn.Reconnect()
+
+	for i := 0; i < 100 && dialled() < 2; i++ {
+		time.Sleep(20 * time.Millisecond)
+	}
+	if dialled() < 2 {
+		t.Errorf("Reconnect did not produce a second attempt: %d", dialled())
+	}
+
+	// And the loop is still the loop: it ends when its context does, not when Reconnect is called.
+	select {
+	case <-done:
+		t.Error("Reconnect stopped the loop")
+	default:
+	}
+}
+
+// Calling it with nothing connected must be harmless — the loop is already dialling.
+func TestReconnectWhileDisconnectedIsSafe(t *testing.T) {
+	New("ws://127.0.0.1:1/nothing", "token", "").Reconnect()
+}
