@@ -84,6 +84,25 @@ func NewWithOptions(url, token, origin string, opts Options) *Conn {
 	return &Conn{url: url, token: token, origin: origin, opts: opts}
 }
 
+// Reconnect drops the current connection so the loop dials again, choosing where to go afresh.
+//
+// It exists because the choice of route is made per attempt, which means a connection that is
+// working stays where it is — correctly, since dropping a healthy link every time a ranking wobbles
+// would be worse than the wobble. But when the set of routes changes, or an operator wants to force
+// the question, there has to be a way to ask for a new attempt without stopping the process. That
+// distinction is not cosmetic here: stopping this process is what kills the screens it hosts, so
+// "reconnect" and "restart" must not be the same button.
+//
+// Safe to call when nothing is connected: the loop is already dialling.
+func (c *Conn) Reconnect() {
+	c.mu.Lock()
+	conn := c.conn
+	c.mu.Unlock()
+	if conn != nil {
+		_ = conn.Close()
+	}
+}
+
 // Run dials and pumps messages to onMsg until ctx is cancelled, reconnecting
 // with capped backoff on any drop.
 func (c *Conn) Run(ctx context.Context, onMsg func(protocol.Msg)) error {
