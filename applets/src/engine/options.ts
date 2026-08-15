@@ -40,6 +40,23 @@ export function readOptions(screen: string): ParsedOption[] {
   return out
 }
 
+/**
+ * The matcher for "this exact option, the one I already found on this screen".
+ *
+ * A caller that has read the options and picked one holds a label, not a pattern — and turning a
+ * label into a bare `new RegExp(escaped)` quietly asks a different question: not "which option is
+ * this" but "which option CONTAINS this". `chooseByLabel` takes the first match, so whenever one
+ * label is a prefix of another the answer is the wrong option, and it is the earlier one — the
+ * position the cursor usually starts from, so the mistake also costs the fewest keystrokes and is
+ * the easiest to make. Claude offers exactly that shape: "Yes" alongside "Yes, and don't ask
+ * again".
+ *
+ * Anchoring both ends makes it the identity question it was always meant to be. Escaping is done
+ * here too, so no caller has to remember that a label like "1.5x (recommended)" is also a regex.
+ */
+export const exactly = (label: string): RegExp =>
+  new RegExp(`^${label.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}$`)
+
 /** What one call to `chooseByLabel` did, so a caller can tell "not yet" from "no such option". */
 export type ChooseResult = 'confirmed' | 'moved' | 'not-ready' | 'absent'
 

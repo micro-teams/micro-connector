@@ -9,6 +9,7 @@ import {
   clean,
   defineDriver,
   ENTER,
+  exactly,
   host,
   Observation,
   parseOption,
@@ -18,11 +19,9 @@ import {
 } from '../engine/driver'
 import type { Choice } from '../engine/driver'
 
-const escapeRe = (s: string) => s.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')
-
 // Permission-mode hunting state (see onIdle).
 let modeCyclesTried = 0
-let bypassUnavailable = false
+let mostPermissiveUnavailable = false
 
 // Login mode. A control plane that must log a fresh machine IN — rather than launch one that is
 // already authenticated — sets the watched variable `mode` to 'login'. Everything below keys off
@@ -117,7 +116,7 @@ function observe(screen: string): Observation {
 
 defineDriver({
   name: 'claude',
-  version: 15,
+  version: 16,
 
   gates: [
     {
@@ -171,7 +170,7 @@ defineDriver({
         const sub = readOptions(c.screen).find((o) =>
           /subscription|claude account|claude\.ai|with your (claude|max|pro)|\bmax\b|\bpro\b/i.test(o.opt.label),
         )
-        if (sub) c.choose(new RegExp(escapeRe(sub.opt.label)))
+        if (sub) c.choose(exactly(sub.opt.label))
         else c.write(ENTER)
       },
     },
@@ -245,17 +244,37 @@ defineDriver({
       return
     }
 
-    const inBypass = /bypass permissions on/i.test(ctx.tail)
-    const inAuto = /auto mode on/i.test(ctx.tail)
-    const modeVisible = inBypass || inAuto || /(accept edits|manual mode|plan mode) on/i.test(ctx.tail)
-    if (inBypass) {
+    // The most permissive mode, under both names it has had: older builds print "bypass permissions
+    // on", current ones "auto mode on". Claude Code 2.1.221 carries its own table of exactly four
+    // modes — default, "accept edits on", "plan mode on", "auto mode on" — and "bypass permissions
+    // on" is no longer among them, so a driver that only knows the old name never recognises
+    // success on a current build.
+    const inMostPermissive = /(bypass permissions|auto mode) on/i.test(ctx.tail)
+    const inAcceptEdits = /accept edits on/i.test(ctx.tail)
+    // The default mode prints NO mode line at all — its row in that table has an empty symbol. So
+    // "there is no mode line" must not mean "do nothing", or the driver parks in the STRICTEST mode
+    // and never leaves. That is exactly what happened on a root machine, where the permissive modes
+    // are refused and the cycle therefore passes through default: it arrived and stopped.
+    //
+    // What the mode line was really standing in for is "this is a settled prompt, not a frame caught
+    // mid-repaint". The prompt's own footer says that directly, and says it in default mode too.
+    const atPrompt = /\? for shortcuts/i.test(ctx.tail)
+    const modeVisible = inMostPermissive || inAcceptEdits || /(plan mode|manual mode) on/i.test(ctx.tail)
+
+    if (inMostPermissive) {
       modeCyclesTried = 0
-      bypassUnavailable = false
-    } else if (bypassUnavailable && inAuto) {
+      mostPermissiveUnavailable = false
+      return
+    }
+    // Settle. Accept-edits is the best mode still on offer when the permissive one is refused, and
+    // stopping here is the point: the alternative is cycling forever past a mode we could have kept.
+    if (mostPermissiveUnavailable && inAcceptEdits) {
       modeCyclesTried = 0
-    } else if (modeVisible && ctx.frame % 2 === 0) {
+      return
+    }
+    if ((modeVisible || atPrompt) && ctx.frame % 2 === 0) {
       ctx.write(SHIFT_TAB)
-      if (++modeCyclesTried >= 7) bypassUnavailable = true
+      if (++modeCyclesTried >= 7) mostPermissiveUnavailable = true
     }
   },
 
@@ -268,7 +287,7 @@ defineDriver({
       const want = parseInt(String(n), 10) || 1
       const opt = readOptions(host.term.read()).find((o) => o.opt.n === want)
       if (!opt) return false
-      chooseByLabel((d) => host.term.write(d), host.term.read(), new RegExp(escapeRe(opt.opt.label)))
+      chooseByLabel((d) => host.term.write(d), host.term.read(), exactly(opt.opt.label))
       return true
     },
     // Two writes, not one: the command text and its submit, the same way a person sends it.

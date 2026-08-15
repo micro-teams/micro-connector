@@ -2,7 +2,7 @@
 import { test } from 'node:test'
 import assert from 'node:assert/strict'
 import { makeHost, runDriver } from './fake-host'
-import { DOWN, ENTER } from '../src/engine/keys'
+import { DOWN, ENTER, SHIFT_TAB } from '../src/engine/keys'
 
 const PASTE_START = '\x1b[200~'
 
@@ -202,4 +202,51 @@ test('normal mode: the OAuth variables stay empty', () => {
   host.frame(OAUTH) // same screen, but no login mode
   assert.equal(host.vars.oauthUrl, '')
   assert.equal(host.vars.loginState, '')
+})
+
+// --- permission mode -------------------------------------------------------
+// T-076. Claude Code 2.1.221 carries a table of exactly four modes: default (no mode line at all),
+// "accept edits on", "plan mode on", "auto mode on". Two things follow, and the driver got both
+// wrong: "bypass permissions on" is no longer one of them, and the strictest mode is the one that
+// prints nothing — so a driver that only acts when it can SEE a mode line stops dead in it.
+
+const withMode = (line: string) =>
+  ['', '╭──────────────╮', '│ >            │', '╰──────────────╯', line, '? for shortcuts', ''].join(
+    '\n',
+  )
+
+/** Feed idle frames until the driver has had `n` chances to act (it acts every other frame). */
+function idleFrames(host: ReturnType<typeof loadDriver>, screen: string, n: number) {
+  for (let i = 0; i < n; i++) host.frame(screen)
+}
+
+test('the most permissive mode is recognised under its CURRENT name, and left alone', () => {
+  const host = loadDriver()
+  idleFrames(host, withMode('⏵⏵ auto mode on'), 6)
+  assert.equal(host.keys(), '', 'it is already in the most permissive mode; touching it can only lose it')
+})
+
+test('the old name still counts, so an older Claude is not cycled out of a good mode', () => {
+  const host = loadDriver()
+  idleFrames(host, withMode('⏵⏵ bypass permissions on'), 6)
+  assert.equal(host.keys(), '')
+})
+
+// The bug nictheboy hit on a root machine: root refuses the permissive modes, the cycle passes
+// through default, and default prints no mode line — so the driver saw nothing to act on and
+// stayed in the strictest mode of all.
+test('the strictest mode prints no mode line, and is still not where the driver settles', () => {
+  const host = loadDriver()
+  const DEFAULT_PROMPT = ['', '╭──────────────╮', '│ >            │', '╰──────────────╯', '? for shortcuts', ''].join('\n')
+  idleFrames(host, DEFAULT_PROMPT, 4)
+  assert.ok(host.keys().includes(SHIFT_TAB), 'no mode line must not mean "do nothing" — that is how it parks in manual')
+})
+
+test('when the permissive mode is refused, it settles on accept-edits instead of cycling forever', () => {
+  const host = loadDriver()
+  // Long enough to exhaust the hunt (7 attempts), landing on accept-edits each time it looks.
+  idleFrames(host, withMode('⏵⏵ accept edits on'), 20)
+  host.clearKeys()
+  idleFrames(host, withMode('⏵⏵ accept edits on'), 6)
+  assert.equal(host.keys(), '', 'having given up on the permissive mode, accept-edits is worth keeping')
 })

@@ -1,7 +1,7 @@
 // The regression tests for the most expensive bug this repository knows about.
 import { test } from 'node:test'
 import assert from 'node:assert/strict'
-import { chooseByLabel, parseOption, readOptions } from '../src/engine/options'
+import { chooseByLabel, exactly, parseOption, readOptions } from '../src/engine/options'
 import { DOWN, ENTER, UP } from '../src/engine/keys'
 
 const gate = (cursorOn: number) =>
@@ -50,4 +50,31 @@ test('an unreadable or absent option is reported, never guessed at', () => {
   assert.equal(w.length, 0, 'nothing may be typed into a frame we cannot read')
   assert.equal(chooseByLabel((d) => w.push(d), gate(1), /no such option/i), 'absent')
   assert.equal(w.length, 0)
+})
+
+// T-070. A caller that has already FOUND its option holds a label, not a pattern — and the old
+// code turned that label into a bare `new RegExp(escaped)`, which asks "which option contains
+// this" rather than "which option is this". chooseByLabel takes the first match, so when one label
+// is a prefix of another the answer is the earlier option. Claude ships exactly that shape.
+const prefixGate = (cursorOn: number) =>
+  [
+    `${cursorOn === 1 ? '❯' : ' '} 1. Yes, and don't ask again`,
+    `${cursorOn === 2 ? '❯' : ' '} 2. Yes`,
+    `${cursorOn === 3 ? '❯' : ' '} 3. No`,
+  ].join('\n')
+
+test('an exact label matches its own option, not a longer one that contains it', () => {
+  const w: string[] = []
+  // Wanting option 2 ("Yes") with the cursor already on it: there is nothing to do but confirm.
+  // Unanchored, /Yes/ finds "Yes, and don't ask again" first and steps AWAY to option 1.
+  assert.equal(chooseByLabel((d) => w.push(d), prefixGate(2), exactly('Yes')), 'confirmed')
+  assert.deepEqual(w, [ENTER], 'it was already on the right option; moving is the bug')
+})
+
+test('an exact label still escapes what would otherwise be regex', () => {
+  const screen = ['❯ 1. Use 1.5x (recommended)', '  2. Use 15x'].join('\n')
+  const w: string[] = []
+  // Unescaped, `1.5x (recommended)` is a pattern whose parens are a group and whose dot is a
+  // wildcard — it would match nothing here, and the option would read as absent.
+  assert.equal(chooseByLabel((d) => w.push(d), screen, exactly('Use 1.5x (recommended)')), 'confirmed')
 })
