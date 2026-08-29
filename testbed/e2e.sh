@@ -54,7 +54,15 @@ cleanup() {
   [ -n "${CONN_PID:-}" ] && kill "$CONN_PID" 2>/dev/null || true
   [ -n "${SRV_PID:-}" ] && kill "$SRV_PID" 2>/dev/null || true
   docker rm -f "$MOCK_CT" >/dev/null 2>&1 || true
-  [ "${KEEP:-0}" = "1" ] || rm -rf "$WORK"
+  # The processes killed above may still be writing under $WORK — the agents' own directories live
+  # there — and a removal that races them fails with "Directory not empty". As the last command of
+  # an EXIT trap under `set -e`, that failure becomes the SCRIPT's exit code: a run that asserted
+  # everything and printed "everything asserted" still ends red. Teardown does not get a vote on
+  # the verdict.
+  if [ "${KEEP:-0}" != "1" ]; then
+    sleep 1
+    rm -rf "$WORK" 2>/dev/null || { sleep 2; rm -rf "$WORK" 2>/dev/null || true; }
+  fi
 }
 trap cleanup EXIT
 
