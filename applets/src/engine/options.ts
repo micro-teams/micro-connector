@@ -72,3 +72,54 @@ export function chooseByLabel(
   for (let i = 0; i < Math.abs(target - current); i++) write(step)
   return 'moved'
 }
+
+/**
+ * The same discipline, for a list whose options carry no numbers.
+ *
+ * Claude Code's folder-trust gate lost its numbering — it now paints
+ *
+ *     ❯ No, exit
+ *       Yes, I trust this folder
+ *
+ * with the cursor on the DESTRUCTIVE option, and [parseOption] sees no options at all. The gate used
+ * to answer this with a bare Enter, on the belief that the default was the safe one; against this
+ * shape that Enter quits Claude Code, and the pane dies three seconds after launch.
+ *
+ * Only the lines DIRECTLY around the cursor are considered part of the list, and a blank line ends
+ * it. That is narrow on purpose: without numbers there is nothing that certainly marks an option,
+ * so the further this reaches the more ordinary output it can mistake for one.
+ *
+ * Returns 'no-list' when the screen shows no cursor at all — a dialog of another shape, which the
+ * caller must answer some other way rather than by moving a cursor that is not there.
+ */
+export function chooseNearCursorByLabel(
+  write: (data: string) => void,
+  screen: string,
+  want: RegExp,
+): ChooseResult | 'no-list' {
+  const lines = screen.split('\n').map(clean)
+  const cursor = lines.findIndex((l) => /^\s*[❯>]\s+\S/.test(l))
+  if (cursor < 0) return 'no-list'
+
+  const labelOf = (line: string): string => line.replace(/^\s*[❯>]?\s*/, '').trim()
+  // Walk outward from the cursor while the lines keep looking like list items — non-empty, and not
+  // the dialog's own footer.
+  const isItem = (line: string): boolean =>
+    line.trim() !== '' && !/Enter to (confirm|continue)|Esc to (cancel|exit)/i.test(line)
+  let first = cursor
+  while (first - 1 >= 0 && isItem(lines[first - 1])) first--
+  let last = cursor
+  while (last + 1 < lines.length && isItem(lines[last + 1])) last++
+
+  const items = lines.slice(first, last + 1)
+  const target = items.findIndex((l) => want.test(labelOf(l)))
+  if (target < 0) return 'absent'
+  const current = cursor - first
+  if (current === target) {
+    write(ENTER)
+    return 'confirmed'
+  }
+  const step = target > current ? DOWN : UP
+  for (let i = 0; i < Math.abs(target - current); i++) write(step)
+  return 'moved'
+}

@@ -34,10 +34,46 @@ test('the bypass gate is answered by label, and never with a bare Enter', () => 
   assert.ok(typed.includes('\x1b[B'), 'it should step down to "Yes, I accept"')
 })
 
-test('the folder-trust gate is answered with Enter', () => {
+test('the folder-trust gate is answered with Enter when there is nothing to move', () => {
   const host = loadDriver()
   host.frame('Is this a project you created or one you trust?\n\n1. Yes, I trust this folder')
   assert.ok(host.keys().includes(ENTER))
+})
+
+test('the folder-trust gate never confirms "No, exit"', () => {
+  // The shape Claude Code paints now: no numbers, and the cursor starts on the option that QUITS.
+  // A bare Enter here — which is what this gate used to do — kills the agent three seconds after
+  // launch, on every folder it has not been trusted with before. Taken from a CI pane that died.
+  const host = loadDriver()
+  host.frame(
+    [
+      ' Quick safety check: Is this a project you created or one you trust?',
+      '',
+      ' Claude Code\'ll be able to read, edit, and execute files here.',
+      '',
+      ' ❯ No, exit',
+      '   Yes, I trust this folder',
+      '',
+      ' Enter to confirm · Esc to cancel',
+    ].join('\n'),
+  )
+  const typed = host.keys()
+  assert.ok(!typed.includes(ENTER), 'an Enter on this frame answers "No, exit"')
+  assert.ok(typed.includes('\x1b[B'), 'it steps down to the option that trusts the folder')
+
+  // And on the next frame, with the cursor where it was moved to, it confirms.
+  host.clearKeys()
+  host.frame(
+    [
+      ' Quick safety check: Is this a project you created or one you trust?',
+      '',
+      '   No, exit',
+      ' ❯ Yes, I trust this folder',
+      '',
+      ' Enter to confirm · Esc to cancel',
+    ].join('\n'),
+  )
+  assert.ok(host.keys().includes(ENTER), 'now Enter means yes')
 })
 
 test('an idle prompt reads as idle, a working one as busy, with its elapsed and tokens', () => {

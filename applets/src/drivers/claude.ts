@@ -6,6 +6,7 @@
 
 import {
   chooseByLabel,
+  chooseNearCursorByLabel,
   clean,
   defineDriver,
   ENTER,
@@ -117,16 +118,33 @@ function observe(screen: string): Observation {
 
 defineDriver({
   name: 'claude',
-  version: 15,
+  version: 16,
 
   gates: [
     {
-      // The folder-trust gate on a fresh cwd. Wording varies by version, and the default option is
-      // the safe one ("Enter to confirm"), so a bare Enter is right. Every frame: it is idempotent.
+      // The folder-trust gate on a fresh cwd. Wording varies by version, and so does the SHAPE.
+      //
+      // It used to be answered with a bare Enter, on the belief that the default was the safe
+      // option. Newer Claude Code paints it as an unnumbered list with the cursor on "No, exit" —
+      // so that Enter quit Claude Code, and the pane died three seconds after launch. Every agent
+      // on a folder it had not been trusted with before was dead on arrival.
+      //
+      // So: pick by LABEL, never by position, in whichever shape this version uses. A bare Enter
+      // is left only for the shape that has no cursor to move at all.
       name: 'folder trust',
       when: /I trust this folder|created or one you trust|Do you trust/i,
       every: 1,
-      act: (c) => c.write(ENTER),
+      act: (c) => {
+        const trusts = /i trust this folder|yes,?\s*proceed/i
+        const numbered = chooseByLabel((d) => c.write(d), c.screen, trusts)
+        if (numbered === 'moved' || numbered === 'confirmed') return
+        // Either there are no numbered options, or there are but the cursor is not painted on this
+        // frame. Both are answered the same way: look for a cursor, and only fall back to Enter
+        // when there is none to move — a dialog with no cursor is not one this can steer.
+        if (chooseNearCursorByLabel((d) => c.write(d), c.screen, trusts) === 'no-list') {
+          c.write(ENTER)
+        }
+      },
     },
     {
       // The bypass-permissions consent, shown the first time Claude Code is started with

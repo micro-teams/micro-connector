@@ -17,7 +17,7 @@ import { host, Owned } from './host'
 import { ENTER, PASTE_END, PASTE_START, PGDN } from './keys'
 import { chooseByLabel, Choice, clean, readOptions } from './options'
 
-export { chooseByLabel, clean, parseOption, readOptions } from './options'
+export { chooseByLabel, chooseNearCursorByLabel, clean, parseOption, readOptions } from './options'
 export type { Choice } from './options'
 export * from './keys'
 export { host } from './host'
