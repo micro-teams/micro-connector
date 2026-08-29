@@ -92,18 +92,29 @@ export function chooseByLabel(
  * Returns 'no-list' when the screen shows no cursor at all — a dialog of another shape, which the
  * caller must answer some other way rather than by moving a cursor that is not there.
  */
-export function chooseNearCursorByLabel(
-  write: (data: string) => void,
-  screen: string,
-  want: RegExp,
-): ChooseResult | 'no-list' {
+/**
+ * The options of an UNNUMBERED list, read from around the cursor.
+ *
+ * Claude Code dropped the numbering from its gates: the folder-trust one and the
+ * bypass-permissions one both paint
+ *
+ *     ❯ No, exit
+ *       Yes, I accept
+ *
+ * with the cursor on the destructive option. [readOptions] sees nothing there, and a driver that
+ * can only read numbers does nothing at all on those frames — an agent that sits at "starting"
+ * forever, or one that answers with a bare Enter and quits.
+ *
+ * Only the lines DIRECTLY around the cursor count, and a blank line ends the list. That is narrow
+ * on purpose: without numbers nothing certainly marks an option, so the further this reaches the
+ * more ordinary output it can mistake for one. The numbers it reports are positions in that block,
+ * so a caller that speaks in numbers keeps working.
+ */
+export function readCursorOptions(screen: string): ParsedOption[] {
   const lines = screen.split('\n').map(clean)
   const cursor = lines.findIndex((l) => /^\s*[❯>]\s+\S/.test(l))
-  if (cursor < 0) return 'no-list'
+  if (cursor < 0) return []
 
-  const labelOf = (line: string): string => line.replace(/^\s*[❯>]?\s*/, '').trim()
-  // Walk outward from the cursor while the lines keep looking like list items — non-empty, and not
-  // the dialog's own footer.
   const isItem = (line: string): boolean =>
     line.trim() !== '' && !/Enter to (confirm|continue)|Esc to (cancel|exit)/i.test(line)
   let first = cursor
@@ -111,10 +122,29 @@ export function chooseNearCursorByLabel(
   let last = cursor
   while (last + 1 < lines.length && isItem(lines[last + 1])) last++
 
-  const items = lines.slice(first, last + 1)
-  const target = items.findIndex((l) => want.test(labelOf(l)))
+  return lines.slice(first, last + 1).map((line, i) => ({
+    opt: { n: i + 1, label: line.replace(/^\s*[❯>]?\s*/, '').trim() },
+    selected: first + i === cursor,
+  }))
+}
+
+/**
+ * [chooseByLabel] for a list with no numbers. Same discipline: relative movement only, and the
+ * Enter on a later frame than the move.
+ *
+ * Returns 'no-list' when the screen shows no cursor at all — a dialog of another shape, which the
+ * caller must answer some other way rather than by moving a cursor that is not there.
+ */
+export function chooseNearCursorByLabel(
+  write: (data: string) => void,
+  screen: string,
+  want: RegExp,
+): ChooseResult | 'no-list' {
+  const options = readCursorOptions(screen)
+  if (options.length === 0) return 'no-list'
+  const target = options.findIndex((o) => want.test(o.opt.label))
   if (target < 0) return 'absent'
-  const current = cursor - first
+  const current = options.findIndex((o) => o.selected)
   if (current === target) {
     write(ENTER)
     return 'confirmed'

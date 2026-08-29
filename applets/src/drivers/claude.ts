@@ -13,6 +13,7 @@ import {
   host,
   Observation,
   parseOption,
+  readCursorOptions,
   readOptions,
   SHIFT_TAB,
   tail as tailOf,
@@ -135,15 +136,13 @@ defineDriver({
       when: /I trust this folder|created or one you trust|Do you trust/i,
       every: 1,
       act: (c) => {
-        const trusts = /i trust this folder|yes,?\s*proceed/i
-        const numbered = chooseByLabel((d) => c.write(d), c.screen, trusts)
-        if (numbered === 'moved' || numbered === 'confirmed') return
-        // Either there are no numbered options, or there are but the cursor is not painted on this
-        // frame. Both are answered the same way: look for a cursor, and only fall back to Enter
-        // when there is none to move — a dialog with no cursor is not one this can steer.
-        if (chooseNearCursorByLabel((d) => c.write(d), c.screen, trusts) === 'no-list') {
+        // A dialog with no cursor anywhere is not one that can be steered — older versions painted
+        // exactly that, and there Enter IS the answer. Everywhere else, pick by label.
+        if (!/[❯>]\s+\S/.test(c.screen)) {
           c.write(ENTER)
+          return
         }
+        c.choose(/i trust this folder|yes,?\s*proceed/i)
       },
     },
     {
@@ -284,9 +283,20 @@ defineDriver({
     // imagined top of the list, which is the bug that made it press "No, exit".)
     choose: (n: unknown) => {
       const want = parseInt(String(n), 10) || 1
-      const opt = readOptions(host.term.read()).find((o) => o.opt.n === want)
+      const screen = host.term.read()
+      // Numbered if this version numbers them, otherwise the block around the cursor — the person
+      // clicked the second option either way, and which shape the program painted is not theirs to
+      // know.
+      const numbered = readOptions(screen)
+      const options = numbered.length > 0 ? numbered : readCursorOptions(screen)
+      const opt = options.find((o) => o.opt.n === want)
       if (!opt) return false
-      chooseByLabel((d) => host.term.write(d), host.term.read(), new RegExp(escapeRe(opt.opt.label)))
+      const label = new RegExp(escapeRe(opt.opt.label))
+      if (numbered.length > 0) {
+        chooseByLabel((d) => host.term.write(d), screen, label)
+      } else {
+        chooseNearCursorByLabel((d) => host.term.write(d), screen, label)
+      }
       return true
     },
     // Two writes, not one: the command text and its submit, the same way a person sends it.

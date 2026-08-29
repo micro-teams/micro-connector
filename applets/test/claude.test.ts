@@ -40,6 +40,28 @@ test('the folder-trust gate is answered with Enter when there is nothing to move
   assert.ok(host.keys().includes(ENTER))
 })
 
+test('the bypass gate is answered when the version stops numbering the options', () => {
+  // The same shape change, on the other gate: no numbers, cursor on the option that quits. The
+  // driver could only read numbered lists, so on these frames it did NOTHING — the agent sat at
+  // "starting" until the harness gave up. Taken from a CI run that did exactly that.
+  const frame = [
+    '  Bypass Permissions mode',
+    '',
+    '  https://code.claude.com/docs/en/security',
+    '',
+    '  ❯ No, exit',
+    '    Yes, I accept',
+    '',
+    '  Enter to confirm · Esc to cancel',
+  ].join('\n')
+  const host = loadDriver()
+  host.frame(frame)
+  host.frame(frame)
+  const typed = host.keys()
+  assert.ok(!typed.includes(ENTER), 'a bare Enter here answers "No, exit"')
+  assert.ok(typed.includes('\x1b[B'), 'it steps down to "Yes, I accept"')
+})
+
 test('the folder-trust gate never confirms "No, exit"', () => {
   // The shape Claude Code paints now: no numbers, and the cursor starts on the option that QUITS.
   // A bare Enter here — which is what this gate used to do — kills the agent three seconds after
