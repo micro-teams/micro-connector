@@ -6,12 +6,14 @@
 
 import {
   chooseByLabel,
+  chooseNearCursorByLabel,
   clean,
   defineDriver,
   ENTER,
   host,
   Observation,
   parseOption,
+  readCursorOptions,
   readOptions,
   SHIFT_TAB,
   tail as tailOf,
@@ -117,16 +119,31 @@ function observe(screen: string): Observation {
 
 defineDriver({
   name: 'claude',
-  version: 15,
+  version: 16,
 
   gates: [
     {
-      // The folder-trust gate on a fresh cwd. Wording varies by version, and the default option is
-      // the safe one ("Enter to confirm"), so a bare Enter is right. Every frame: it is idempotent.
+      // The folder-trust gate on a fresh cwd. Wording varies by version, and so does the SHAPE.
+      //
+      // It used to be answered with a bare Enter, on the belief that the default was the safe
+      // option. Newer Claude Code paints it as an unnumbered list with the cursor on "No, exit" —
+      // so that Enter quit Claude Code, and the pane died three seconds after launch. Every agent
+      // on a folder it had not been trusted with before was dead on arrival.
+      //
+      // So: pick by LABEL, never by position, in whichever shape this version uses. A bare Enter
+      // is left only for the shape that has no cursor to move at all.
       name: 'folder trust',
       when: /I trust this folder|created or one you trust|Do you trust/i,
       every: 1,
-      act: (c) => c.write(ENTER),
+      act: (c) => {
+        // A dialog with no cursor anywhere is not one that can be steered — older versions painted
+        // exactly that, and there Enter IS the answer. Everywhere else, pick by label.
+        if (!/[❯>]\s+\S/.test(c.screen)) {
+          c.write(ENTER)
+          return
+        }
+        c.choose(/i trust this folder|yes,?\s*proceed/i)
+      },
     },
     {
       // The bypass-permissions consent, shown the first time Claude Code is started with
@@ -266,9 +283,20 @@ defineDriver({
     // imagined top of the list, which is the bug that made it press "No, exit".)
     choose: (n: unknown) => {
       const want = parseInt(String(n), 10) || 1
-      const opt = readOptions(host.term.read()).find((o) => o.opt.n === want)
+      const screen = host.term.read()
+      // Numbered if this version numbers them, otherwise the block around the cursor — the person
+      // clicked the second option either way, and which shape the program painted is not theirs to
+      // know.
+      const numbered = readOptions(screen)
+      const options = numbered.length > 0 ? numbered : readCursorOptions(screen)
+      const opt = options.find((o) => o.opt.n === want)
       if (!opt) return false
-      chooseByLabel((d) => host.term.write(d), host.term.read(), new RegExp(escapeRe(opt.opt.label)))
+      const label = new RegExp(escapeRe(opt.opt.label))
+      if (numbered.length > 0) {
+        chooseByLabel((d) => host.term.write(d), screen, label)
+      } else {
+        chooseNearCursorByLabel((d) => host.term.write(d), screen, label)
+      }
       return true
     },
     // Two writes, not one: the command text and its submit, the same way a person sends it.

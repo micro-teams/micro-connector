@@ -15,9 +15,23 @@
 
 import { host, Owned } from './host'
 import { ENTER, PASTE_END, PASTE_START, PGDN } from './keys'
-import { chooseByLabel, Choice, clean, readOptions } from './options'
+import {
+  chooseByLabel,
+  chooseNearCursorByLabel,
+  Choice,
+  clean,
+  readCursorOptions,
+  readOptions,
+} from './options'
 
-export { chooseByLabel, clean, parseOption, readOptions } from './options'
+export {
+  chooseByLabel,
+  chooseNearCursorByLabel,
+  clean,
+  parseOption,
+  readCursorOptions,
+  readOptions,
+} from './options'
 export type { Choice } from './options'
 export * from './keys'
 export { host } from './host'
@@ -203,7 +217,13 @@ export function defineDriver(spec: DriverSpec): void {
         frame,
         write: (d) => term.write(d),
         choose: (want) => {
-          chooseByLabel((d) => term.write(d), screen, want)
+          // Numbered first, then the unnumbered shape. Claude Code dropped the numbers from its
+          // gates — both the folder-trust one and the bypass-permissions one now paint a bare list
+          // with the cursor on "No, exit" — and a driver that could only read numbers simply did
+          // nothing on those frames, which is an agent that sits at "starting" forever.
+          if (chooseByLabel((d) => term.write(d), screen, want) === 'absent') {
+            chooseNearCursorByLabel((d) => term.write(d), screen, want)
+          }
         },
       }
       const up = typeof gate.when === 'function' ? gate.when(gctx) : gate.when.test(screen)
