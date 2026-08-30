@@ -75,8 +75,22 @@ func NewManager() (*Manager, error) {
 			dir = legacy
 		}
 	}
+	// Before this moved off /tmp, the directory was one that always worked. Now it is under $HOME (or
+	// $XDG_RUNTIME_DIR), and those can be unwritable, missing, or hidden from the process — systemd's
+	// ProtectHome does exactly that. Failing here would mean a connector that will not start at all,
+	// which is a far worse day than a socket in a less private place, so the old location is the
+	// last resort rather than the error.
 	if err := os.MkdirAll(dir, 0o700); err != nil {
-		return nil, fmt.Errorf("terminal: runtime dir: %w", err)
+		fallback := brand.Current.LegacyRuntimePath()
+		if fallback == dir {
+			return nil, fmt.Errorf("terminal: runtime dir: %w", err)
+		}
+		fmt.Fprintf(os.Stderr, "%s: cannot use %s (%v); falling back to %s\n",
+			brand.Current.Name, dir, err, fallback)
+		if err := os.MkdirAll(fallback, 0o700); err != nil {
+			return nil, fmt.Errorf("terminal: runtime dir: %w", err)
+		}
+		dir = fallback
 	}
 	conf := filepath.Join(dir, "tmux.conf")
 	if err := os.WriteFile(conf, []byte("set -g remain-on-exit on\n"), 0o600); err != nil {

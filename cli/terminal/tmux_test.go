@@ -3,6 +3,7 @@ package terminal
 import (
 	"bytes"
 	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 	"time"
@@ -224,5 +225,37 @@ func TestChunkEnd(t *testing.T) {
 	}
 	if got := chunkEnd([]byte{0x80, 0x80, 0x80, 0x80}, 2); got != 2 {
 		t.Errorf("chunkEnd of invalid UTF-8 = %d, want 2 (no stall)", got)
+	}
+}
+
+// A connector that cannot start is worse than a socket in a less private place.
+//
+// The runtime dir used to be under /tmp, which always worked. It is under $HOME now, and $HOME can
+// be unwritable, missing, or hidden from the process — systemd's ProtectHome does precisely that.
+// Returning an error there would take the whole connector down on machines that used to be fine.
+func TestNewManagerFallsBackWhenTheRuntimeDirCannotBeMade(t *testing.T) {
+	if _, err := findTmux(); err != nil {
+		t.Skip("no tmux available")
+	}
+	tmp := t.TempDir()
+	t.Setenv("TMPDIR", tmp)
+	t.Setenv("XDG_RUNTIME_DIR", "")
+
+	// A home that cannot be written into: a FILE where the directory would have to be.
+	home := filepath.Join(t.TempDir(), "home")
+	if err := os.MkdirAll(filepath.Join(home, ".local"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(home, ".local", "state"), []byte("not a directory"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("HOME", home)
+
+	m, err := NewManager()
+	if err != nil {
+		t.Fatalf("gave up instead of falling back: %v", err)
+	}
+	if !strings.HasPrefix(m.sock, tmp) {
+		t.Fatalf("fell back to %q, which is not the old location under %q", m.sock, tmp)
 	}
 }
