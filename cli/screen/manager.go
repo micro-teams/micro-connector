@@ -286,7 +286,23 @@ func (m *Manager) createSession(msg protocol.Msg) {
 
 func (m *Manager) subscribeScreen(sid string, cols, rows int) {
 	s := m.session(sid)
-	if s == nil || s.client != nil {
+	// Somebody is waiting on the other end of this, so not hosting it has to be SAID. The server
+	// believes a screen is live until told otherwise; staying quiet leaves it believing that while
+	// a person watches a terminal that never opens — the exact shape of the report this came from:
+	// "microteams and the CLI both say connected, but the screen cannot actually be opened".
+	//
+	// It happens whenever the sessions died without this process watching them go: a stop kills the
+	// tmux server (`link disconnect` does), and a reboot takes it with /tmp. Reconnecting brings the
+	// link back but not the sessions, and the server's records outlive them.
+	//
+	// `session.error` is the report a failed adopt already makes, so the server's existing path
+	// takes it from here: mark the screen dead, then rebuild it the next time somebody opens it.
+	if s == nil {
+		_ = m.conn.Send(protocol.Msg{T: "session.error", Sid: sid,
+			Error: "terminal: this machine is not hosting that screen"})
+		return
+	}
+	if s.client != nil {
 		return
 	}
 	// A fresh viewer always starts on the live screen: clear any copy-mode a
