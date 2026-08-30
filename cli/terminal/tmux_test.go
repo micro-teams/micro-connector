@@ -7,6 +7,8 @@ import (
 	"strings"
 	"testing"
 	"time"
+
+	"github.com/micro-teams/micro-connector/cli/brand"
 )
 
 // isolated builds a Manager whose tmux server is this test's alone.
@@ -257,5 +259,58 @@ func TestNewManagerFallsBackWhenTheRuntimeDirCannotBeMade(t *testing.T) {
 	}
 	if !strings.HasPrefix(m.sock, tmp) {
 		t.Fatalf("fell back to %q, which is not the old location under %q", m.sock, tmp)
+	}
+}
+
+// The crossing: an update in place must come back to the socket the previous build is running.
+//
+// The old build put it under the temp dir. A new one that went straight to $HOME would start a
+// SECOND tmux server and orphan everything the first is hosting — every screen on the machine,
+// still running, attached to a socket nobody looks at again. This is the claim the release rests
+// on, so it is asserted rather than commented.
+func TestAnUpdateKeepsUsingTheSocketTheOldBuildLeftRunning(t *testing.T) {
+	if _, err := findTmux(); err != nil {
+		t.Skip("no tmux available")
+	}
+	tmp := t.TempDir()
+	t.Setenv("TMPDIR", tmp)
+	t.Setenv("XDG_RUNTIME_DIR", "")
+	t.Setenv("HOME", t.TempDir())
+
+	// What the previous build left behind: its runtime dir, with a socket in it.
+	legacy := brand.Current.LegacyRuntimePath()
+	if err := os.MkdirAll(legacy, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(legacy, "t.sock"), nil, 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	m, err := NewManager()
+	if err != nil {
+		t.Fatalf("NewManager: %v", err)
+	}
+	if want := filepath.Join(legacy, "t.sock"); m.sock != want {
+		t.Fatalf("went to %q instead of %q — the sessions the old build is hosting are orphaned",
+			m.sock, want)
+	}
+}
+
+// And with nothing left behind, it uses the new home rather than the temp dir it came from.
+func TestAFreshMachineGetsTheNewPath(t *testing.T) {
+	if _, err := findTmux(); err != nil {
+		t.Skip("no tmux available")
+	}
+	t.Setenv("TMPDIR", t.TempDir())
+	home := t.TempDir()
+	t.Setenv("XDG_RUNTIME_DIR", "")
+	t.Setenv("HOME", home)
+
+	m, err := NewManager()
+	if err != nil {
+		t.Fatalf("NewManager: %v", err)
+	}
+	if !strings.HasPrefix(m.sock, home) {
+		t.Fatalf("a machine with nothing to inherit went to %q, not under %q", m.sock, home)
 	}
 }
