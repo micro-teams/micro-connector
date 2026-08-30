@@ -69,6 +69,34 @@ func (b Brand) Getenv(name string) string { return os.Getenv(b.Env(name)) }
 // RuntimePath is the per-user runtime directory: a STABLE path, not a fresh temp dir. The tmux
 // server outlives the connector process, so a restarted or self-updated connector must arrive back
 // at the same socket to find the sessions it left behind.
+//
+// It is deliberately NOT under /tmp any more, and both reasons were paid for on a live machine:
+//
+//   - /tmp is world-writable, so "<brand>-<uid>" is a name anything can take first. Whoever wins
+//     the race owns the directory, and the loser cannot open its own socket.
+//   - /tmp is a tmpfs on a normal systemd box, so it is empty after a reboot. That is survivable
+//     for the socket (the sessions are gone too) but it means the connector comes back to a
+//     directory it does not own if something else got there first during boot.
+//
+// $XDG_RUNTIME_DIR is what this is for — per-user, 0700, and already there when a person is logged
+// in. It is NOT there for a system service that starts at boot before any login, so the fallback
+// is a path under $HOME rather than back to /tmp. Only with neither does it use the temp dir, so a
+// process with no home still runs.
 func (b Brand) RuntimePath() string {
+	if dir := os.Getenv("XDG_RUNTIME_DIR"); dir != "" {
+		if fi, err := os.Stat(dir); err == nil && fi.IsDir() {
+			return filepath.Join(dir, b.RuntimeDir)
+		}
+	}
+	if home, err := os.UserHomeDir(); err == nil && home != "" {
+		return filepath.Join(home, ".local", "state", b.RuntimeDir)
+	}
+	return filepath.Join(os.TempDir(), b.RuntimeDir+"-"+strconv.Itoa(os.Getuid()))
+}
+
+// LegacyRuntimePath is where RuntimePath used to be: under the temp dir. Kept so an in-place update
+// can find a tmux server started by the previous build instead of stranding its sessions on a
+// socket nobody looks at any more — which is the failure the stable-path comment above is about.
+func (b Brand) LegacyRuntimePath() string {
 	return filepath.Join(os.TempDir(), b.RuntimeDir+"-"+strconv.Itoa(os.Getuid()))
 }
