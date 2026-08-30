@@ -305,6 +305,20 @@ func (m *Manager) subscribeScreen(sid string, cols, rows int) {
 	if s.client != nil {
 		return
 	}
+	// Having a record of the screen is not the same as the screen being there. tmux can die while
+	// this process lives — a `tmux kill-server`, an OOM, anything that takes the server without
+	// taking us — and Attach would not notice: it forks a pty and starts `tmux attach-session` in
+	// it, which SUCCEEDS as a fork even though the tmux inside it exits immediately with "no such
+	// session". A viewer then gets a pty that dies quietly, and still nobody has said anything.
+	//
+	// So ask tmux, which is the only thing that knows, before handing anybody a terminal.
+	if !m.tm.HasSession(sid) {
+		m.closeSession(sid)
+		_ = m.conn.Send(protocol.Msg{T: "session.error", Sid: sid,
+			Error: "terminal: that screen's session is gone"})
+		m.publishState()
+		return
+	}
 	// A fresh viewer always starts on the live screen: clear any copy-mode a
 	// previous viewer left behind on the pane.
 	s.term.ExitCopyMode()

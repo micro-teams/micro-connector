@@ -17,14 +17,23 @@ import (
 // it. That is not hypothetical: it happened twice on 2026-07-31 and was investigated for hours as a
 // spontaneous tmux death, OOM included, before the test suite turned out to be the killer.
 //
-// Overriding TMPDIR moves the whole runtime dir somewhere only this test knows about — which is what
-// the comments below always claimed and never did.
+// So every input RuntimePath reads is pointed somewhere only this test knows about, and then the
+// socket it produced is CHECKED to be in there. The check is the part that lasts: TMPDIR alone was
+// enough when the runtime dir came from the temp dir, and stopped being enough the moment it moved
+// to $XDG_RUNTIME_DIR / $HOME. Without an assertion, that change was silent — the suite went on
+// passing while pointing at the live socket again.
 func isolated(t *testing.T) *Manager {
 	t.Helper()
-	t.Setenv("TMPDIR", t.TempDir())
+	dir := t.TempDir()
+	t.Setenv("TMPDIR", dir)
+	t.Setenv("XDG_RUNTIME_DIR", dir)
+	t.Setenv("HOME", dir)
 	m, err := NewManager()
 	if err != nil {
 		t.Fatalf("NewManager: %v", err)
+	}
+	if !strings.HasPrefix(m.sock, dir) {
+		t.Fatalf("this test's tmux server is at %q, outside %q — it would kill the live one", m.sock, dir)
 	}
 	return m
 }
