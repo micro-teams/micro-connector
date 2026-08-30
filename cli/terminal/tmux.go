@@ -66,6 +66,15 @@ func NewManager() (*Manager, error) {
 	// surviving sessions. A random dir per process would strand them on an orphan
 	// socket (which is exactly what broke in-place update before this).
 	dir := brand.Current.RuntimePath()
+	// An update in place must arrive back at the socket the previous build left running. That build
+	// put it under the temp dir, so if a live socket is still there, keep using it for this process
+	// rather than starting a second tmux server and orphaning whatever it is hosting. New machines
+	// and later restarts get the new path; nobody loses a session in the crossing.
+	if legacy := brand.Current.LegacyRuntimePath(); legacy != dir {
+		if _, err := os.Stat(filepath.Join(legacy, "t.sock")); err == nil {
+			dir = legacy
+		}
+	}
 	if err := os.MkdirAll(dir, 0o700); err != nil {
 		return nil, fmt.Errorf("terminal: runtime dir: %w", err)
 	}

@@ -17,6 +17,7 @@ import (
 	"fmt"
 	"os"
 	"os/exec"
+	"path/filepath"
 	"strings"
 	"sync"
 	"time"
@@ -219,9 +220,19 @@ func (m *Manager) createSession(msg protocol.Msg) {
 	// The server owns the screen's identity: it hands down an opaque token in
 	// msg.Screen, which the host injects as MICROTEAMS_SCREEN so any process the screen
 	// spawns can prove which screen it belongs to when it calls back.
-	env := make([]string, 0, len(msg.Env)+1)
+	env := make([]string, 0, len(msg.Env)+2)
 	if msg.Screen != "" {
 		env = append(env, brand.Current.Env("SCREEN")+"="+msg.Screen)
+	}
+	// A temp directory of this user's own, so what the hosted program scratches down is not in
+	// /tmp. Programs name their scratch space after the uid — Claude Code writes /tmp/claude-$UID —
+	// and /tmp is world-writable, so that name is a race: whoever creates it first owns it, and on
+	// a tmpfs /tmp the race is re-run at every boot. The morning this was written, root had won it,
+	// and the agent died about a minute after starting, every time.
+	//
+	// Set before msg.Env so a server that has an opinion about TMPDIR still wins.
+	if tmp, err := screenTmpDir(msg.Sid); err == nil {
+		env = append(env, "TMPDIR="+tmp)
 	}
 	for k, v := range msg.Env {
 		env = append(env, k+"="+v)
@@ -275,7 +286,37 @@ func (m *Manager) createSession(msg protocol.Msg) {
 
 func (m *Manager) subscribeScreen(sid string, cols, rows int) {
 	s := m.session(sid)
-	if s == nil || s.client != nil {
+	// Somebody is waiting on the other end of this, so not hosting it has to be SAID. The server
+	// believes a screen is live until told otherwise; staying quiet leaves it believing that while
+	// a person watches a terminal that never opens — the exact shape of the report this came from:
+	// "microteams and the CLI both say connected, but the screen cannot actually be opened".
+	//
+	// It happens whenever the sessions died without this process watching them go: a stop kills the
+	// tmux server (`link disconnect` does), and a reboot takes it with /tmp. Reconnecting brings the
+	// link back but not the sessions, and the server's records outlive them.
+	//
+	// `session.error` is the report a failed adopt already makes, so the server's existing path
+	// takes it from here: mark the screen dead, then rebuild it the next time somebody opens it.
+	if s == nil {
+		_ = m.conn.Send(protocol.Msg{T: "session.error", Sid: sid,
+			Error: "terminal: this machine is not hosting that screen"})
+		return
+	}
+	if s.client != nil {
+		return
+	}
+	// Having a record of the screen is not the same as the screen being there. tmux can die while
+	// this process lives — a `tmux kill-server`, an OOM, anything that takes the server without
+	// taking us — and Attach would not notice: it forks a pty and starts `tmux attach-session` in
+	// it, which SUCCEEDS as a fork even though the tmux inside it exits immediately with "no such
+	// session". A viewer then gets a pty that dies quietly, and still nobody has said anything.
+	//
+	// So ask tmux, which is the only thing that knows, before handing anybody a terminal.
+	if !m.tm.HasSession(sid) {
+		m.closeSession(sid)
+		_ = m.conn.Send(protocol.Msg{T: "session.error", Sid: sid,
+			Error: "terminal: that screen's session is gone"})
+		m.publishState()
 		return
 	}
 	// A fresh viewer always starts on the live screen: clear any copy-mode a
@@ -481,3 +522,14 @@ func (b *busAdapter) ReplyServer(id string, result any, errStr string) {
 // SetInbound is unused: the host routes inbound messages to the runtime directly
 // (see onMsg), so the adapter needs no reference back.
 func (b *busAdapter) SetInbound(runtime.Inbound) {}
+
+// screenTmpDir is a scratch directory belonging to this user, made once per screen so one agent
+// cannot read what another left behind. It sits beside the runtime dir rather than in /tmp — see
+// brand.RuntimePath for why that matters.
+func screenTmpDir(sid string) (string, error) {
+	dir := filepath.Join(brand.Current.RuntimePath(), "tmp", sid)
+	if err := os.MkdirAll(dir, 0o700); err != nil {
+		return "", err
+	}
+	return dir, nil
+}
