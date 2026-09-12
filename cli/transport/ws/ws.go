@@ -174,6 +174,13 @@ func (c *Conn) dialer() *websocket.Dialer {
 	}
 	d := *websocket.DefaultDialer
 	d.NetDialContext = c.opts.NetDial
+	// And no proxy. DefaultDialer takes one from the environment, which is right when the library is
+	// opening its own socket and nonsense when it is not: with HTTPS_PROXY set, gorilla would write
+	// a CONNECT request into the connection the caller supplied — a proxy handshake sent to
+	// something that is not a proxy. A machine with a proxy configured is ordinary, so this is not
+	// hypothetical; it is what the first end-to-end attempt actually did, and the far end answered
+	// 400 with no clue why.
+	d.Proxy = nil
 	return &d
 }
 

@@ -8,6 +8,7 @@ package ws
 
 import (
 	"context"
+	"errors"
 	"net"
 	"net/http"
 	"net/http/httptest"
@@ -230,5 +231,32 @@ func TestWithoutNetDialTheLibraryStillDials(t *testing.T) {
 
 	if dialled() == 0 {
 		t.Error("the configured URL was never dialled")
+	}
+}
+
+// A supplied connection is not reached through a proxy.
+//
+// DefaultDialer takes one from the environment, which is right when the library opens its own
+// socket and nonsense when it does not: with HTTPS_PROXY set, gorilla writes a CONNECT request into
+// the connection the caller supplied — a proxy handshake sent to something that is not a proxy. It
+// is what the first end-to-end attempt actually did, on an ordinary machine that has a proxy
+// configured, and the far end answered 400 with no clue why.
+//
+// Asserted on the dialler rather than through the environment, because net/http reads the proxy
+// variables once per process and caches the answer: a test that set them would be testing whichever
+// test happened to run first.
+func TestASuppliedConnectionIsNotReachedThroughAProxy(t *testing.T) {
+	supplied := NewWithOptions("ws://example.invalid/x", "", "", Options{
+		NetDial: func(ctx context.Context, network, address string) (net.Conn, error) {
+			return nil, errors.New("not dialled in this test")
+		},
+	})
+	if supplied.dialer().Proxy != nil {
+		t.Error("a caller-supplied connection must not be wrapped in a proxy handshake")
+	}
+
+	// And the default is untouched for everyone else, proxy included.
+	if plain := New("ws://example.invalid/x", "", ""); plain.dialer() != websocket.DefaultDialer {
+		t.Error("without NetDial the package default dialler must be used unchanged")
 	}
 }
