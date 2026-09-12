@@ -8,6 +8,7 @@ package ws
 
 import (
 	"context"
+	"net"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -181,4 +182,53 @@ func TestReconnectDialsAgainWithoutStopping(t *testing.T) {
 // Calling it with nothing connected must be harmless — the loop is already dialling.
 func TestReconnectWhileDisconnectedIsSafe(t *testing.T) {
 	New("ws://127.0.0.1:1/nothing", "token", "").Reconnect()
+}
+
+// The seam that lets the connection be carried inside something else.
+//
+// What this pins is that the library stops opening its own socket: the connection the product
+// supplies is the one the handshake and every frame afterwards travel on. It is proved by giving it
+// a conn to somewhere the URL does not name — the URL points at a port with nothing on it, and the
+// session still succeeds — because a test where NetDial dials the same address it was given would
+// pass just as well if the option were ignored entirely.
+func TestNetDialCarriesTheConnectionInsteadOfTheLibrary(t *testing.T) {
+	real, dialled := server(t, 0)
+
+	var mu sync.Mutex
+	asked := 0
+	conn := NewWithOptions("ws://127.0.0.1:1/nothing-here", "token", "https://api.example", Options{
+		NetDial: func(ctx context.Context, network, address string) (net.Conn, error) {
+			mu.Lock()
+			asked++
+			mu.Unlock()
+			return (&net.Dialer{}).DialContext(ctx, network, strings.TrimPrefix(real, "ws://"))
+		},
+	})
+
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer cancel()
+	_ = conn.Run(ctx, func(protocol.Msg) {})
+
+	mu.Lock()
+	times := asked
+	mu.Unlock()
+	if times == 0 {
+		t.Fatal("NetDial was never asked for a connection: the library opened its own")
+	}
+	if dialled() == 0 {
+		t.Error("the handshake never reached the server the supplied connection went to")
+	}
+}
+
+// And with it unset, nothing changes — the library dials, as every existing consumer relies on.
+func TestWithoutNetDialTheLibraryStillDials(t *testing.T) {
+	only, dialled := server(t, 0)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+	_ = NewWithOptions(only, "token", "https://api.example", Options{}).Run(ctx, func(protocol.Msg) {})
+
+	if dialled() == 0 {
+		t.Error("the configured URL was never dialled")
+	}
 }

@@ -16,6 +16,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"net"
 	"net/http"
 	"sync"
 	"time"
@@ -54,6 +55,20 @@ type Options struct {
 	// matters: a route that completes the handshake and severs the connection a second later looks
 	// like a success on every attempt, and a client that believed it would reconnect to it forever.
 	Report func(url string, held time.Duration, err error)
+	// NetDial supplies the connection each attempt is made over, instead of the library opening a
+	// TCP connection to the URL's host itself. The handshake and every frame afterwards are written
+	// to whatever it returns; TLS, if the URL asks for it, is negotiated on top.
+	//
+	// This exists because a route is not always a socket. A machine may already hold a transport to
+	// the control plane — several network paths aggregated into one stream, say — and the right
+	// thing is then to carry this connection INSIDE it rather than beside it: a path failing
+	// underneath stops being a disconnection at all, because the stream survives it and this
+	// WebSocket never learns a link changed. The alternative, dialling out separately, means the
+	// control link drops and reconnects every time one route dies, which for a machine is the
+	// difference between briefly offline and never offline.
+	//
+	// nil means the library dials, exactly as it always did.
+	NetDial func(ctx context.Context, network, address string) (net.Conn, error)
 }
 
 // Conn maintains the dial-out websocket to the control plane.
@@ -148,6 +163,20 @@ func (c *Conn) Run(ctx context.Context, onMsg func(protocol.Msg)) error {
 	}
 }
 
+// dialer is the gorilla dialer for one attempt: the package default unless the product supplied a
+// way to open the connection itself.
+//
+// The default is returned as a VALUE copy rather than the shared DefaultDialer pointer, so that a
+// caller with NetDial set can never mutate the dialer every other user of this package shares.
+func (c *Conn) dialer() *websocket.Dialer {
+	if c.opts.NetDial == nil {
+		return websocket.DefaultDialer
+	}
+	d := *websocket.DefaultDialer
+	d.NetDialContext = c.opts.NetDial
+	return &d
+}
+
 func (c *Conn) runOnce(
 	ctx context.Context,
 	url string,
@@ -160,7 +189,7 @@ func (c *Conn) runOnce(
 	if c.origin != "" {
 		header.Set("X-Microteams-Origin", c.origin)
 	}
-	conn, _, err := websocket.DefaultDialer.DialContext(ctx, url, header)
+	conn, _, err := c.dialer().DialContext(ctx, url, header)
 	if err != nil {
 		return false, err
 	}
