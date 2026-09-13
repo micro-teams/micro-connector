@@ -204,6 +204,45 @@ func (s *Session) capture() (string, error) {
 	return out.String(), nil
 }
 
+// CaptureANSI returns the pane's current content WITH its SGR color/attribute escapes intact (`-e`),
+// so a synthetic redraw handed to a second viewer looks exactly like what a real attach would have
+// painted, colors included. Unlike a real tmux attach, this carries no leading clear-screen sequence
+// and no trailing cursor positioning — a caller that wants those (see CursorPosition) adds them.
+func (s *Session) CaptureANSI() (string, error) {
+	var out, stderr bytes.Buffer
+	cmd := s.m.tmux("capture-pane", "-t", s.name, "-e", "-p")
+	cmd.Stdout = &out
+	cmd.Stderr = &stderr
+	if err := cmd.Run(); err != nil {
+		return "", fmt.Errorf("terminal: capture(ansi) %q: %w: %s", s.name, err, stderr.String())
+	}
+	return out.String(), nil
+}
+
+// CursorPosition returns the pane's current cursor column and row, both 0-indexed (tmux's own
+// convention for #{cursor_x}/#{cursor_y}), so a synthetic redraw can place the cursor where a real
+// attach would have left it instead of wherever capture-pane's last printed line happens to end.
+func (s *Session) CursorPosition() (col, row int, err error) {
+	var out, stderr bytes.Buffer
+	cmd := s.m.tmux("display-message", "-t", s.name, "-p", "-F", "#{cursor_x} #{cursor_y}")
+	cmd.Stdout = &out
+	cmd.Stderr = &stderr
+	if runErr := cmd.Run(); runErr != nil {
+		return 0, 0, fmt.Errorf("terminal: cursor position %q: %w: %s", s.name, runErr, stderr.String())
+	}
+	fields := strings.Fields(strings.TrimSpace(out.String()))
+	if len(fields) != 2 {
+		return 0, 0, fmt.Errorf("terminal: cursor position %q: unexpected output %q", s.name, out.String())
+	}
+	if col, err = strconv.Atoi(fields[0]); err != nil {
+		return 0, 0, fmt.Errorf("terminal: cursor position %q: %w", s.name, err)
+	}
+	if row, err = strconv.Atoi(fields[1]); err != nil {
+		return 0, 0, fmt.Errorf("terminal: cursor position %q: %w", s.name, err)
+	}
+	return col, row, nil
+}
+
 // OnGone registers fn, called at most once, when this session is confirmed to be
 // gone — its tmux session (or the whole server) died under us.
 //
