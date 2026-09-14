@@ -303,6 +303,19 @@ func (m *Manager) subscribeScreen(sid string, cols, rows int) {
 		return
 	}
 	if s.client != nil {
+		// Somebody is already attached, so tmux will not do us the favor a fresh `attach-session`
+		// does automatically: it emits a full clear+repaint only for the client that causes the
+		// attach, and the transport doesn't let a second real tmux client share a pty here (the
+		// hub sends only ONE screen.subscribe per NEW viewer, but there is one already-open pty
+		// for the whole screen — see MachineHub.attachViewer on the backend). Without something
+		// here, a second (or later) viewer is added to the hub's fan-out list and then simply waits
+		// for the *next* incidental change to paint over an initially blank/wrong local buffer —
+		// which is the exact gap this fix closes; see also ViewerPump's file header on the backend.
+		//
+		// So synthesize what a real attach would have sent: capture the pane as it stands right
+		// now, with color intact, and wrap it the same way a genuine attach frames a repaint —
+		// clear+home first, cursor placed and made visible last.
+		m.sendSyntheticSnapshot(sid, s)
 		return
 	}
 	// Having a record of the screen is not the same as the screen being there. tmux can die while
@@ -334,6 +347,40 @@ func (m *Manager) subscribeScreen(sid string, cols, rows int) {
 	s.client = client
 	s.lastCols, s.lastRows = cols, rows
 	m.mu.Unlock()
+}
+
+// sendSyntheticSnapshot reconstructs what a real `tmux attach-session` would have painted for a
+// viewer who cannot get one, because this screen already has a client attached (see the call site
+// in subscribeScreen for why real tmux cannot just hand out a second one here).
+//
+// Sent as an ordinary screen.data message, this is indistinguishable on the wire from a real
+// attach's output — and the backend's fan-out is not addressed to one viewer, so EVERY existing
+// viewer of this screen receives it too. For a viewer who already has a correct picture that is a
+// harmless, rare redraw flash — nothing here is wrong for them, just repainted — which is a good
+// trade for a viewer who would otherwise stay on a blank or stale screen indefinitely. There is no
+// finer-grained addressing in the current wire protocol to avoid it.
+func (m *Manager) sendSyntheticSnapshot(sid string, s *sess) {
+	body, err := s.term.CaptureANSI()
+	if err != nil {
+		// Nothing to send is no worse than today's silent nothing — and unlike subscribeScreen's
+		// other failure paths, the screen IS live (a client is attached to it right now), so this
+		// is not something the server needs telling about.
+		return
+	}
+	col, row, err := s.term.CursorPosition()
+	if err != nil {
+		col, row = 0, 0
+	}
+	var b strings.Builder
+	b.WriteString("\x1b[H\x1b[J") // clear + home, matching what a real attach sends first
+	// capture-pane -p joins lines with a bare "\n"; a terminal only moves down on that unless
+	// line-feed mode is on (it is not, by default), so each join has to carry its own "\r" too, or
+	// every line after the first renders stacked at the same column instead of on its own row.
+	b.WriteString(strings.ReplaceAll(body, "\n", "\r\n"))
+	fmt.Fprintf(&b, "\x1b[%d;%dH", row+1, col+1) // tmux's cursor_x/y are 0-indexed; CUP is 1-indexed
+	b.WriteString("\x1b[?25h")                   // cursor visible, matching what a real attach ends with
+	_ = m.conn.Send(protocol.Msg{T: "screen.data", Sid: sid,
+		Data: base64.StdEncoding.EncodeToString([]byte(b.String()))})
 }
 
 func (m *Manager) unsubscribeScreen(sid string) {
