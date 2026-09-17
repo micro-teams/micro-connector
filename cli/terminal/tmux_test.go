@@ -330,3 +330,24 @@ func TestAFreshMachineGetsTheNewPath(t *testing.T) {
 		t.Fatalf("a machine with nothing to inherit went to %q, not under %q", m.sock, home)
 	}
 }
+
+// TestDisabledFailsCleanlyRatherThanPanicking guards the actual reason Disabled exists: a caller
+// that gets one back must be able to call every Manager operation on it exactly like a real one —
+// getting a normal error back, never a nil-pointer panic — since the whole point is not needing a
+// nil check at every call site.
+func TestDisabledFailsCleanlyRatherThanPanicking(t *testing.T) {
+	m := Disabled()
+	if m == nil {
+		t.Fatal("Disabled() returned nil — callers would still need a nil check")
+	}
+	if m.HasSession("anything") {
+		t.Error("HasSession on a disabled manager reported true")
+	}
+	if n := m.LiveSessions(); n != 0 {
+		t.Errorf("LiveSessions on a disabled manager = %d, want 0", n)
+	}
+	if _, err := m.Spawn("s1", []string{"sh", "-c", "true"}, nil, 80, 24); err == nil {
+		t.Error("Spawn on a disabled manager succeeded — nothing is actually hosting it")
+	}
+	m.KillServer() // must not panic
+}

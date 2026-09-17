@@ -115,6 +115,18 @@ func NewManager() (*Manager, error) {
 	return &Manager{bin: bin, sock: filepath.Join(dir, "t.sock"), conf: conf}, nil
 }
 
+// Disabled returns a Manager that never actually hosts anything: every operation (Spawn,
+// HasSession, Attach, ...) fails cleanly through the exact same error-reporting path a real spawn
+// failure would (exec.Command with an empty Path errors "exec: no command" rather than panicking),
+// instead of a caller needing to nil-check a *Manager it never got.
+//
+// For a product that wants to keep running everything screens don't touch — the control
+// connection, the local proxy, enrolment — on a platform (or a machine) where NewManager returned
+// ErrUnsupported or any other error, rather than treating "no screens here" as fatal to the whole
+// process. Callers that DO need to know screens are unavailable should still check NewManager's own
+// error before falling back to this; Disabled exists for the ones that don't.
+func Disabled() *Manager { return &Manager{} }
+
 func (m *Manager) tmux(args ...string) *exec.Cmd {
 	full := append([]string{"-S", m.sock, "-f", m.conf}, args...)
 	cmd := exec.Command(m.bin, full...)
