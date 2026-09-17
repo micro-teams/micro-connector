@@ -28,10 +28,12 @@ func TestASecondViewerGetsASnapshot(t *testing.T) {
 	if _, err := exec.LookPath("tmux"); err != nil {
 		t.Skip("no tmux available")
 	}
-	dir := t.TempDir()
+	// shortTempDir, not t.TempDir(): this test's own name is long enough to overflow AF_UNIX's
+	// socket path limit on macOS (104 bytes there) once nested under t.TempDir()'s test-name path.
+	dir := shortTempDir(t)
 	t.Setenv("TMPDIR", dir)
 	t.Setenv("XDG_RUNTIME_DIR", dir)
-	t.Setenv("HOME", dir)
+	setHome(t, dir)
 
 	tm, err := terminal.NewManager()
 	if err != nil {

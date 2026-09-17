@@ -30,11 +30,12 @@ func TestOpeningAScreenAfterTmuxDiedIsAnswered(t *testing.T) {
 	}
 	// Every input the runtime path reads, pointed at this test's own directory — see the same
 	// reasoning in terminal's isolated(): these tests kill tmux servers, and the suite once killed
-	// the live one.
-	dir := t.TempDir()
+	// the live one. shortTempDir, not t.TempDir(), for the same reason terminal's isolated() uses
+	// it — this test's own name is long enough to overflow AF_UNIX's path limit on macOS.
+	dir := shortTempDir(t)
 	t.Setenv("TMPDIR", dir)
 	t.Setenv("XDG_RUNTIME_DIR", dir)
-	t.Setenv("HOME", dir)
+	setHome(t, dir)
 
 	tm, err := terminal.NewManager()
 	if err != nil {

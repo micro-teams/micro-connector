@@ -22,6 +22,22 @@ func setHome(t *testing.T, dir string) {
 	}
 }
 
+// shortTempDir is t.TempDir(), except its path does not embed the calling test's name. That name
+// becomes part of a tmux socket's path when a test points XDG_RUNTIME_DIR/HOME at it, and AF_UNIX
+// has a real, short limit on that (108 bytes on Linux, 104 on macOS) — a long enough test name
+// pushes t.TempDir()'s own path past it and tmux fails with "File name too long", nothing to do
+// with the code under test. Not hypothetical: TestOpeningAScreenAfterTmuxDiedIsAnswered is exactly
+// such a name, and hit precisely this on a real macOS CI runner.
+func shortTempDir(t *testing.T) string {
+	t.Helper()
+	dir, err := os.MkdirTemp("", "mc")
+	if err != nil {
+		t.Fatalf("shortTempDir: %v", err)
+	}
+	t.Cleanup(func() { _ = os.RemoveAll(dir) })
+	return dir
+}
+
 // A hosted program must scratch in a directory this user owns.
 //
 // The bug this pins: programs name their scratch space after the uid — Claude Code uses
