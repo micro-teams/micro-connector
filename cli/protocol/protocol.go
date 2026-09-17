@@ -38,8 +38,9 @@ type Msg struct {
 	// re-exec): the host re-establishes the runtime + driver around the existing
 	// tmux instead of spawning a new session. Unknown to older peers (ignored).
 	Adopt bool `json:"adopt,omitempty"`
-	// Data carries base64-encoded raw terminal bytes for the direct screen
-	// channel (screen.data downstream, screen.input upstream).
+	// Data carries base64-encoded bytes: raw terminal bytes for the direct screen channel
+	// (screen.data downstream, screen.input upstream), or a file's content for file.write /
+	// file.read.result.
 	Data string `json:"data,omitempty"`
 	// Dir is the direction of a screen.scroll request ("up" / "down" / "bottom"):
 	// the viewer paging through the pane's tmux scrollback (copy-mode). Unknown to
@@ -53,6 +54,15 @@ type Msg struct {
 	Stderr    string `json:"stderr,omitempty"`
 	Exit      int    `json:"exit,omitempty"`
 	Truncated bool   `json:"truncated,omitempty"` // output hit the size cap and was clipped
+	// Structured, shell-free file access: file.write (request, carries Path + Data) / file.write.
+	// result (Error), file.read (request, Path) / file.read.result (Data, Error), file.remove
+	// (request, Path) / file.remove.result (Error), homedir (request, no fields) / homedir.result
+	// (Path carries the resolved directory, Error). These exist so a control plane never has to
+	// know or guess what shell (if any) is on a machine — os.WriteFile/os.ReadFile/os.UserHomeDir/
+	// os.Remove behave identically on every platform this connector targets, where "run this bash
+	// script" only ever worked on Unix. Path is also reused as the response field for homedir
+	// specifically because that IS a path, not a new dedicated field.
+	Path string `json:"path,omitempty"`
 }
 
 // Transport carries the message set. Implementations differ in everything except this: a resident

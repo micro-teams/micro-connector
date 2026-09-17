@@ -164,6 +164,14 @@ func (m *Manager) Dispatch(msg protocol.Msg) {
 		go m.runExec(msg)
 	case "exec.cancel": // stop an in-flight exec (e.g. the caller's timeout fired)
 		m.cancelExec(msg.ID)
+	case "file.write": // structured, shell-free file write — see protocol.Msg's Path doc comment
+		go m.fileWrite(msg)
+	case "file.read":
+		go m.fileRead(msg)
+	case "file.remove":
+		go m.fileRemove(msg)
+	case "homedir":
+		go m.homeDir(msg)
 	case "update": // the control plane asks this machine to update itself
 		if m.OnUpdateRequested != nil {
 			go m.OnUpdateRequested()
@@ -518,6 +526,91 @@ func (m *Manager) cancelExec(id string) {
 	if cancel != nil {
 		cancel()
 	}
+}
+
+// fileWriteMode is the permission every file.write creates or overwrites a file with: owner
+// read/write only. Every caller of this RPC so far (CA cert, proxy credentials, settings.json) is
+// writing something either secret or meant for exactly one user's Claude Code to read — there is no
+// current use case for anything more permissive, so this is not a caller-supplied field.
+const fileWriteMode = 0o600
+
+// fileWrite writes msg.Data (base64) to msg.Path, creating parent directories as needed and
+// replacing any existing file atomically (write to a sibling temp file, then rename) — the same
+// mkdir+write-temp+rename shape the bash script this replaces used, done with os calls instead of a
+// shell so it works identically on every platform this connector targets.
+func (m *Manager) fileWrite(msg protocol.Msg) {
+	respond := func(errText string) {
+		_ = m.conn.Send(protocol.Msg{T: "file.write.result", ID: msg.ID, Error: errText})
+	}
+	if msg.Path == "" {
+		respond("file.write: empty path")
+		return
+	}
+	data, err := base64.StdEncoding.DecodeString(msg.Data)
+	if err != nil {
+		respond(fmt.Sprintf("file.write: bad base64: %v", err))
+		return
+	}
+	if err := os.MkdirAll(filepath.Dir(msg.Path), 0o700); err != nil {
+		respond(fmt.Sprintf("file.write: mkdir: %v", err))
+		return
+	}
+	tmp := msg.Path + ".tmp"
+	if err := os.WriteFile(tmp, data, fileWriteMode); err != nil {
+		respond(fmt.Sprintf("file.write: %v", err))
+		return
+	}
+	if err := os.Rename(tmp, msg.Path); err != nil {
+		_ = os.Remove(tmp)
+		respond(fmt.Sprintf("file.write: rename: %v", err))
+		return
+	}
+	respond("")
+}
+
+// fileRead answers with msg.Path's content (base64), or an empty, error-free result when the file
+// does not exist — matching the `cat 'path' 2>/dev/null || true` this replaces, which callers here
+// use for a read-modify-write merge over a file that may not have been created yet.
+func (m *Manager) fileRead(msg protocol.Msg) {
+	if msg.Path == "" {
+		_ = m.conn.Send(protocol.Msg{T: "file.read.result", ID: msg.ID, Error: "file.read: empty path"})
+		return
+	}
+	b, err := os.ReadFile(msg.Path)
+	if err != nil {
+		if os.IsNotExist(err) {
+			_ = m.conn.Send(protocol.Msg{T: "file.read.result", ID: msg.ID})
+			return
+		}
+		_ = m.conn.Send(protocol.Msg{T: "file.read.result", ID: msg.ID, Error: err.Error()})
+		return
+	}
+	_ = m.conn.Send(protocol.Msg{T: "file.read.result", ID: msg.ID, Data: base64.StdEncoding.EncodeToString(b)})
+}
+
+// fileRemove deletes msg.Path. Removing a file that is already gone is success, not an error —
+// matching `rm -f`, the cleanup this replaces.
+func (m *Manager) fileRemove(msg protocol.Msg) {
+	errText := ""
+	if msg.Path == "" {
+		errText = "file.remove: empty path"
+	} else if err := os.Remove(msg.Path); err != nil && !os.IsNotExist(err) {
+		errText = err.Error()
+	}
+	_ = m.conn.Send(protocol.Msg{T: "file.remove.result", ID: msg.ID, Error: errText})
+}
+
+// homeDir answers with this machine's real home directory — os.UserHomeDir(), not $HOME read
+// through a shell, so it is correct even when the connector's own process environment has no HOME
+// set (a documented, real condition on at least one platform this runs on) and needs no shell to
+// exist on the machine at all.
+func (m *Manager) homeDir(msg protocol.Msg) {
+	home, err := os.UserHomeDir()
+	if err != nil {
+		_ = m.conn.Send(protocol.Msg{T: "homedir.result", ID: msg.ID, Error: err.Error()})
+		return
+	}
+	_ = m.conn.Send(protocol.Msg{T: "homedir.result", ID: msg.ID, Path: home})
 }
 
 // cappedBuffer accumulates up to limit bytes and silently drops the rest, so a
