@@ -143,6 +143,11 @@ jobs:
       - uses: actions/setup-go@v5
         with:
           go-version-file: cli/go.mod
+      - uses: actions/setup-java@v4
+        if: matrix.leg != 'fake'
+        with:
+          distribution: temurin
+          java-version: "21"
       - name: End to end (${{ matrix.leg }})
         run: |
           if ! command -v tmux >/dev/null; then
