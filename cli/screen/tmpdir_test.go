@@ -3,11 +3,24 @@ package screen
 import (
 	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"testing"
 
 	"github.com/micro-teams/micro-connector/cli/brand"
 )
+
+// setHome overrides the current user's home directory for the duration of the test, on whichever
+// platform's own convention os.UserHomeDir actually reads: $HOME everywhere except Windows, where
+// it is %USERPROFILE% instead. Setting only HOME leaves a Windows test reading the real runner's
+// profile dir, not the fake one.
+func setHome(t *testing.T, dir string) {
+	t.Helper()
+	t.Setenv("HOME", dir)
+	if runtime.GOOS == "windows" {
+		t.Setenv("USERPROFILE", dir)
+	}
+}
 
 // A hosted program must scratch in a directory this user owns.
 //
@@ -19,7 +32,7 @@ import (
 func TestScreenTmpDirIsOursAndNotUnderTmp(t *testing.T) {
 	home := t.TempDir()
 	t.Setenv("XDG_RUNTIME_DIR", "")
-	t.Setenv("HOME", home)
+	setHome(t, home)
 
 	dir, err := screenTmpDir("s1234")
 	if err != nil {
@@ -36,15 +49,19 @@ func TestScreenTmpDirIsOursAndNotUnderTmp(t *testing.T) {
 	if err != nil {
 		t.Fatalf("not created: %v", err)
 	}
-	if perm := fi.Mode().Perm(); perm != 0o700 {
-		t.Fatalf("mode is %o — another user can read what an agent scratched down", perm)
+	// Windows has no POSIX permission bits — os.FileMode.Perm() there reflects the read-only
+	// attribute, not real per-owner access control, so 0700 is not a meaningful thing to assert.
+	if runtime.GOOS != "windows" {
+		if perm := fi.Mode().Perm(); perm != 0o700 {
+			t.Fatalf("mode is %o — another user can read what an agent scratched down", perm)
+		}
 	}
 }
 
 // Two screens do not share one scratch directory: one agent's leftovers are not another's to read.
 func TestEachScreenGetsItsOwn(t *testing.T) {
 	t.Setenv("XDG_RUNTIME_DIR", "")
-	t.Setenv("HOME", t.TempDir())
+	setHome(t, t.TempDir())
 
 	a, err := screenTmpDir("sAAA")
 	if err != nil {

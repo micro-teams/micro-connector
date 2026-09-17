@@ -53,7 +53,11 @@ func TestOpeningAScreenAfterTmuxDiedIsAnswered(t *testing.T) {
 		time.Sleep(20 * time.Millisecond)
 	}
 	if !tm.HasSession("s1") {
-		t.Fatal("the session never started, so this test cannot say anything about losing it")
+		var said []string
+		for _, msg := range conn.all() {
+			said = append(said, msg.T+":"+msg.Error)
+		}
+		t.Fatalf("the session never started, so this test cannot say anything about losing it (connector said: %v)", said)
 	}
 
 	// The stop, the disconnect, the reboot: the tmux server goes, the connector is not told.
