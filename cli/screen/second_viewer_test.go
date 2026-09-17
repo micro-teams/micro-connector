@@ -28,10 +28,12 @@ func TestASecondViewerGetsASnapshot(t *testing.T) {
 	if _, err := exec.LookPath("tmux"); err != nil {
 		t.Skip("no tmux available")
 	}
-	dir := t.TempDir()
+	// shortTempDir, not t.TempDir(): this test's own name is long enough to overflow AF_UNIX's
+	// socket path limit on macOS (104 bytes there) once nested under t.TempDir()'s test-name path.
+	dir := shortTempDir(t)
 	t.Setenv("TMPDIR", dir)
 	t.Setenv("XDG_RUNTIME_DIR", dir)
-	t.Setenv("HOME", dir)
+	setHome(t, dir)
 
 	tm, err := terminal.NewManager()
 	if err != nil {
@@ -52,7 +54,11 @@ func TestASecondViewerGetsASnapshot(t *testing.T) {
 		time.Sleep(20 * time.Millisecond)
 	}
 	if !tm.HasSession("s1") {
-		t.Fatal("the session never started")
+		var said []string
+		for _, msg := range conn.all() {
+			said = append(said, msg.T+":"+msg.Error)
+		}
+		t.Fatalf("the session never started (connector said: %v)", said)
 	}
 
 	// The FIRST viewer: a real screen.subscribe, which does a real tmux attach.
