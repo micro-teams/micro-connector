@@ -55,6 +55,50 @@ jobs:
           # message, months later, on someone else's machine.
           go test -race ./...
 
+  # macOS gets the exact same job as Linux, not a narrowed one: it has a real tmux (via Homebrew)
+  # and creack/pty has a real Darwin implementation, so screens genuinely work there — this is what
+  # makes "macOS should work unchanged" a tested claim instead of an assumption, the same gap that
+  # WSL support above exists to close for Linux-under-Windows.
+  go-macos:
+    name: cli (build + tests, macos)
+    runs-on: macos-latest
+    defaults:
+      run:
+        working-directory: cli
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: cli/go.mod
+      - name: Test
+        run: |
+          command -v tmux >/dev/null || brew install tmux
+          go vet ./...
+          go test -race ./...
+
+  # Native Windows has no tmux/pty backend at all (screens are ErrUnsupported there by design — see
+  # terminal.ErrUnsupported), so this is deliberately narrower than the Linux `go` job: no tmux
+  # install, no -race (Windows' race detector needs a C toolchain this runner doesn't carry). What it
+  # exists to catch is what cross-compiling from Linux cannot: real Windows build/vet/test failures
+  # (path handling, the service package's Windows-only branches, wsl.conf helpers that must no-op
+  # cleanly off Linux) — the same class of "assumed to work, never actually run" gap that WSL support
+  # was added specifically to close.
+  go-windows:
+    name: cli (build + tests, windows)
+    runs-on: windows-latest
+    defaults:
+      run:
+        working-directory: cli
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: cli/go.mod
+      - name: Test
+        run: |
+          go vet ./...
+          go test ./...
+
   # The job this repository exists for. `fake` is the deterministic baseline — if it is red, we broke
   # something. The real-Claude legs answer a different question: whether Claude Code changed under
   # us. The pinned one is required, because pinned means it can only break when we change something;
@@ -89,7 +133,7 @@ jobs:
 
   ci-success:
     name: CI success
-    needs: [applets, go, testbed]
+    needs: [applets, go, go-macos, go-windows, testbed]
     runs-on: ubuntu-latest
     steps:
       - run: echo "All required CI jobs passed."

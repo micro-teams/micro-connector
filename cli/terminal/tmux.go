@@ -6,11 +6,13 @@ package terminal
 
 import (
 	"bytes"
+	"errors"
 	"fmt"
 	"github.com/micro-teams/micro-connector/cli/brand"
 	"os"
 	"os/exec"
 	"path/filepath"
+	"runtime"
 	"strconv"
 	"strings"
 	"sync"
@@ -27,12 +29,26 @@ type Manager struct {
 	conf string
 }
 
+// ErrUnsupported means this platform cannot host a screen at all — not "tmux is missing and could
+// be installed", but "no tmux build exists here that would work". Native Windows is the case today:
+// even a tmux.exe on PATH would not help, because Attach's pty (github.com/creack/pty) is itself a
+// stub on windows (see its start_windows.go) and always fails. Callers use errors.Is(err,
+// ErrUnsupported) to tell "this machine/platform just doesn't do screens" (log and carry on) apart
+// from "tmux should be here and isn't" (a real misconfiguration worth surfacing).
+var ErrUnsupported = errors.New("terminal: screens are not supported on this platform")
+
 // findTmux prefers a private tmux owned by this installation over whatever the host system happens
 // to have: the brand's own TMUX variable, then <user-config>/<brand>/bin/tmux (placed there by an
 // installer), then PATH as a last resort. This keeps the connector self-contained — a machine
 // without tmux works once the installer drops one in, and a machine with a quirky system tmux is
 // never at its mercy.
 func findTmux() (string, error) {
+	// Short-circuit rather than let a PATH tmux.exe (WSL/Cygwin/MSYS builds exist) get this far and
+	// fail confusingly later: the pty this package attaches through has no Windows implementation,
+	// so no tmux binary on native Windows would ever work.
+	if runtime.GOOS == "windows" {
+		return "", ErrUnsupported
+	}
 	if p := brand.Current.Getenv("TMUX"); p != "" {
 		if _, err := os.Stat(p); err == nil {
 			return p, nil
