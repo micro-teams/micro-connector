@@ -17,6 +17,7 @@ import (
 	"fmt"
 	"os"
 	"os/exec"
+	"os/user"
 	"path/filepath"
 	"strings"
 	"sync"
@@ -600,17 +601,22 @@ func (m *Manager) fileRemove(msg protocol.Msg) {
 	_ = m.conn.Send(protocol.Msg{T: "file.remove.result", ID: msg.ID, Error: errText})
 }
 
-// homeDir answers with this machine's real home directory — os.UserHomeDir(), not $HOME read
-// through a shell, so it is correct even when the connector's own process environment has no HOME
-// set (a documented, real condition on at least one platform this runs on) and needs no shell to
-// exist on the machine at all.
+// homeDir answers with this machine's real home directory. os.UserHomeDir() alone is not enough:
+// on Unix it is nothing more than a $HOME read, which is genuinely unset in some real launch
+// contexts (an SSH-driven non-login `exec`, some service/unit configurations) even though the
+// account plainly has a home directory — so it falls back to os/user.Current(), which resolves
+// the real account record (getpwuid on Unix) rather than an environment variable. Needs no shell
+// to exist on the machine at all either way.
 func (m *Manager) homeDir(msg protocol.Msg) {
-	home, err := os.UserHomeDir()
-	if err != nil {
-		_ = m.conn.Send(protocol.Msg{T: "homedir.result", ID: msg.ID, Error: err.Error()})
+	if home, err := os.UserHomeDir(); err == nil && home != "" {
+		_ = m.conn.Send(protocol.Msg{T: "homedir.result", ID: msg.ID, Path: home})
 		return
 	}
-	_ = m.conn.Send(protocol.Msg{T: "homedir.result", ID: msg.ID, Path: home})
+	if u, err := user.Current(); err == nil && u.HomeDir != "" {
+		_ = m.conn.Send(protocol.Msg{T: "homedir.result", ID: msg.ID, Path: u.HomeDir})
+		return
+	}
+	_ = m.conn.Send(protocol.Msg{T: "homedir.result", ID: msg.ID, Error: "homedir: could not resolve a home directory"})
 }
 
 // cappedBuffer accumulates up to limit bytes and silently drops the rest, so a
