@@ -122,6 +122,9 @@ jobs:
           - leg: npm:2.1.220
             os: ubuntu-latest
             experimental: false
+          - leg: pi:0.87.0
+            os: ubuntu-latest
+            experimental: false
           - leg: installer
             os: ubuntu-latest
             experimental: true
