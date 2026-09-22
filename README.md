@@ -71,6 +71,31 @@ The package is published to GitHub Packages, so your `.npmrc` needs
 connector as a screen's applet; it is the same file this repository's CI drives a real Claude Code
 with.
 
+## Platform support
+
+Linux, macOS and native Windows are all CI-tested (`.github/workflows/ci.yml`'s `go`, `go-macos` and
+`go-windows` jobs) — "should work unchanged" is a tested claim on all three, not an assumption.
+macOS runs the exact same suite as Linux (real tmux via Homebrew, `-race` included): unlike Windows,
+its pty layer is real, so screens work there too.
+
+**WSL2** is Linux to everything in this repo (`runtime.GOOS == "linux"`), but WSL2 does not run
+systemd as its PID 1 unless a distro opts in — without that, `service.New`'s systemd --user install
+fails outright. Call `service.EnsureSystemd()` before installing: off WSL it is a no-op
+(`SystemdNotApplicable`); on WSL with systemd already active it is also a no-op (`SystemdActive`);
+otherwise it flips wsl.conf's `[boot] systemd` key (a boolean, safe to set unconditionally — never
+its free-text `command` key, which may already hold a user's own boot script) and returns
+`SystemdNeedsRestart`, since nothing inside the current WSL session can make that take effect —
+the operator has to run `wsl --shutdown` from Windows and reopen the distro.
+
+**Native Windows** has no per-user service: `service.New` always installs a system-level Windows
+service there (needs an elevated/"Run as administrator" process — there is no unprivileged
+fallback), and screens are unavailable outright. `terminal.NewManager` returns `terminal.
+ErrUnsupported` immediately on Windows rather than searching for a `tmux.exe` that would not help
+regardless — the pty layer underneath (`github.com/creack/pty`) has no Windows implementation, so no
+tmux binary on that platform makes screens work. Everything else — enrolment, the control
+connection, applet-free command execution — is unaffected; a product built on this library treats
+`ErrUnsupported` as "this machine cannot host a screen," not as a fatal error.
+
 ## Status
 
 0.1.0. One product — MicroTeams — is built on it and runs it in production, with its own end-to-end
