@@ -49,11 +49,10 @@ print((json.load(sys.stdin)['rpc'].get('$id') or {}).get('value') or '(no snapsh
 }
 step() { printf '\n== %s ==\n' "$1"; }
 
-MOCK_CT=micro-connector-mock
 cleanup() {
   [ -n "${CONN_PID:-}" ] && kill "$CONN_PID" 2>/dev/null || true
   [ -n "${SRV_PID:-}" ] && kill "$SRV_PID" 2>/dev/null || true
-  docker rm -f "$MOCK_CT" >/dev/null 2>&1 || true
+  [ -n "${MOCK_PID:-}" ] && kill "$MOCK_PID" 2>/dev/null || true
   # The processes killed above may still be writing under $WORK — the agents' own directories live
   # there — and a removal that races them fails with "Directory not empty". As the last command of
   # an EXIT trap under `set -e`, that failure becomes the SCRIPT's exit code: a run that asserted
@@ -108,10 +107,28 @@ if [ "$LEG" != "fake" ]; then
   command -v claude >/dev/null || fail "Claude Code did not install"
   echo "claude: $(claude --version 2>&1 | head -1)"
 
-  docker rm -f "$MOCK_CT" >/dev/null 2>&1 || true
-  # 7.5.0 or newer: `httpLlmResponse` — MockServer's Anthropic emulation — does not exist before it,
-  # and an older image answers the expectation with a 400 that says nothing about why.
-  docker run -d --name "$MOCK_CT" -p 1080:1080 mockserver/mockserver:mockserver-7.5.0 >/dev/null
+  # MockServer as a plain jar, not a container: Docker Engine does not exist on GitHub-hosted
+  # macOS/Windows runners at all (Apple's virtualization terms forbid nesting it, and Windows
+  # runners never had it for this use), so a docker-run mock would only ever work on Linux. The
+  # shaded jar-with-dependencies is the same artifact the official Docker image itself downloads
+  # from Maven Central (see mock-server/mockserver's docker/Dockerfile) — same server, same
+  # version, just invoked directly. It needs only a JVM, which every OS here has via
+  # actions/setup-java. TLS/tcnative is irrelevant: this test only ever talks to it over plain
+  # HTTP on 127.0.0.1:1080.
+  #
+  # 7.5.0 or newer: `httpLlmResponse` — MockServer's Anthropic emulation — does not exist before
+  # it, and an older release answers the expectation with a 400 that says nothing about why.
+  MOCK_VERSION=7.5.0
+  MOCK_JAR="$WORK/mockserver-netty-$MOCK_VERSION-jar-with-dependencies.jar"
+  command -v java >/dev/null || fail "no JVM found — MockServer needs one (see actions/setup-java in CI)"
+  curl -fsSL -o "$MOCK_JAR" \
+    "https://repo1.maven.org/maven2/org/mock-server/mockserver-netty/$MOCK_VERSION/mockserver-netty-$MOCK_VERSION-jar-with-dependencies.jar"
+  # -p, not -serverPort: this is the jar-with-dependencies CLI, invoked exactly as the official
+  # Docker image's own build does it (see mock-server/mockserver's docker/Dockerfile) — their docs
+  # page shows a different flag/subcommand for the separate -no-dependencies artifact, which is not
+  # what this is.
+  java -jar "$MOCK_JAR" -p 1080 >"$WORK/mockserver.log" 2>&1 &
+  MOCK_PID=$!
   for _ in $(seq 1 60); do
     curl -fsS -X PUT "http://127.0.0.1:1080/mockserver/status" >/dev/null 2>&1 && break
     sleep 1

@@ -11,6 +11,7 @@ import (
 	"errors"
 	"log"
 	"os"
+	"runtime"
 	"time"
 
 	ksvc "github.com/kardianos/service"
@@ -63,11 +64,20 @@ func (p *program) Stop(_ ksvc.Service) error {
 // LaunchAgent), needing neither. A machine's config already lives in the user's home, so per-user
 // is the natural default for an unprivileged install.
 //
+// Windows has no equivalent of a per-user service: kardianos's windows backend never reads the
+// "UserService" option (see its service_windows.go) and always registers with the Windows Service
+// Manager, which is inherently a system-level, admin-only mechanism. os.Geteuid() is also always -1
+// there (Windows has no euid), so it cannot stand in for "am I privileged" the way it does on
+// Unix. Installing on Windows therefore always takes the system-unit branch below and always needs
+// an elevated (Run as administrator) process — there is no unprivileged install to fall back to.
+//
 // run may be nil for callers that only mean to install, stop or uninstall: those never start the
 // work, and the service manager launches a fresh process when it needs to.
 func New(cfgPath string, run Runner) (ksvc.Service, error) {
-	// Default to a per-user service when unprivileged, a system service when root.
-	return newService(cfgPath, os.Geteuid() != 0, run)
+	// Default to a per-user service when unprivileged, a system service when root — except on
+	// Windows, where "per-user" is not a thing kardianos or the OS's service manager offers.
+	userService := runtime.GOOS != "windows" && os.Geteuid() != 0
+	return newService(cfgPath, userService, run)
 }
 
 // newService builds the service as either a per-user or a system unit.
@@ -81,15 +91,22 @@ func newService(cfgPath string, userService bool, run Runner) (ksvc.Service, err
 		Description: brand.Current.ServiceDescription,
 		Arguments:   []string{"run", "--config", cfgPath},
 	}
-	if userService {
-		// A per-user service (systemd --user / launchd LaunchAgent): no root or polkit.
+	switch {
+	case userService:
+		// A per-user service (systemd --user / launchd LaunchAgent): no root or polkit. Never
+		// reached on Windows — see New()'s doc comment.
 		cfg.Option = ksvc.KeyValue{"UserService": true}
-	} else if u := os.Getenv("SUDO_USER"); u != "" && u != "root" {
-		// A *system* unit that starts at boot with nobody logged in — but run it AS the
-		// invoking user so it uses that user's home (config + private tmux) and gets a
-		// real $HOME (restish and tmux both need one; systemd/launchd populate HOME from
-		// the account database when User is set).
-		cfg.UserName = u
+	case runtime.GOOS != "windows":
+		if u := os.Getenv("SUDO_USER"); u != "" && u != "root" {
+			// A *system* unit that starts at boot with nobody logged in — but run it AS the
+			// invoking user so it uses that user's home (config + private tmux) and gets a
+			// real $HOME (restish and tmux both need one; systemd/launchd populate HOME from
+			// the account database when User is set). SUDO_USER is a sudo-ism; Windows'
+			// elevation (a UAC-elevated process) carries no equivalent env var, and the Windows
+			// Service Manager runs LocalSystem by default regardless, so there is nothing to
+			// set here for that platform.
+			cfg.UserName = u
+		}
 	}
 	return ksvc.New(&program{run: run}, cfg)
 }

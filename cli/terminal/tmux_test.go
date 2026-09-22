@@ -11,6 +11,22 @@ import (
 	"github.com/micro-teams/micro-connector/cli/brand"
 )
 
+// shortTempDir is t.TempDir(), except its path does not embed the calling test's name. That name
+// becomes part of a tmux socket's path here, and AF_UNIX has a real, short limit on that (108 bytes
+// on Linux, 104 on macOS) — a test with a long enough name (or nested subtests, which append
+// another path segment) pushes t.TempDir()'s own path past it and tmux fails with "File name too
+// long", nothing to do with the code under test. Not hypothetical: TestOpeningAScreenAfterTmux
+// DiedIsAnswered is exactly such a name, and hit precisely this on a real macOS CI runner.
+func shortTempDir(t *testing.T) string {
+	t.Helper()
+	dir, err := os.MkdirTemp("", "mc")
+	if err != nil {
+		t.Fatalf("shortTempDir: %v", err)
+	}
+	t.Cleanup(func() { _ = os.RemoveAll(dir) })
+	return dir
+}
+
 // isolated builds a Manager whose tmux server is this test's alone.
 //
 // NewManager deliberately derives its socket from a STABLE per-user path, so that a restarted or
@@ -27,7 +43,7 @@ import (
 // passing while pointing at the live socket again.
 func isolated(t *testing.T) *Manager {
 	t.Helper()
-	dir := t.TempDir()
+	dir := shortTempDir(t)
 	t.Setenv("TMPDIR", dir)
 	t.Setenv("XDG_RUNTIME_DIR", dir)
 	t.Setenv("HOME", dir)
@@ -239,12 +255,12 @@ func TestNewManagerFallsBackWhenTheRuntimeDirCannotBeMade(t *testing.T) {
 	if _, err := findTmux(); err != nil {
 		t.Skip("no tmux available")
 	}
-	tmp := t.TempDir()
+	tmp := shortTempDir(t)
 	t.Setenv("TMPDIR", tmp)
 	t.Setenv("XDG_RUNTIME_DIR", "")
 
 	// A home that cannot be written into: a FILE where the directory would have to be.
-	home := filepath.Join(t.TempDir(), "home")
+	home := filepath.Join(shortTempDir(t), "home")
 	if err := os.MkdirAll(filepath.Join(home, ".local"), 0o700); err != nil {
 		t.Fatal(err)
 	}
@@ -272,10 +288,10 @@ func TestAnUpdateKeepsUsingTheSocketTheOldBuildLeftRunning(t *testing.T) {
 	if _, err := findTmux(); err != nil {
 		t.Skip("no tmux available")
 	}
-	tmp := t.TempDir()
+	tmp := shortTempDir(t)
 	t.Setenv("TMPDIR", tmp)
 	t.Setenv("XDG_RUNTIME_DIR", "")
-	t.Setenv("HOME", t.TempDir())
+	t.Setenv("HOME", shortTempDir(t))
 
 	// What the previous build left behind: its runtime dir, with a socket in it.
 	legacy := brand.Current.LegacyRuntimePath()
@@ -301,8 +317,8 @@ func TestAFreshMachineGetsTheNewPath(t *testing.T) {
 	if _, err := findTmux(); err != nil {
 		t.Skip("no tmux available")
 	}
-	t.Setenv("TMPDIR", t.TempDir())
-	home := t.TempDir()
+	t.Setenv("TMPDIR", shortTempDir(t))
+	home := shortTempDir(t)
 	t.Setenv("XDG_RUNTIME_DIR", "")
 	t.Setenv("HOME", home)
 
@@ -313,4 +329,25 @@ func TestAFreshMachineGetsTheNewPath(t *testing.T) {
 	if !strings.HasPrefix(m.sock, home) {
 		t.Fatalf("a machine with nothing to inherit went to %q, not under %q", m.sock, home)
 	}
+}
+
+// TestDisabledFailsCleanlyRatherThanPanicking guards the actual reason Disabled exists: a caller
+// that gets one back must be able to call every Manager operation on it exactly like a real one —
+// getting a normal error back, never a nil-pointer panic — since the whole point is not needing a
+// nil check at every call site.
+func TestDisabledFailsCleanlyRatherThanPanicking(t *testing.T) {
+	m := Disabled()
+	if m == nil {
+		t.Fatal("Disabled() returned nil — callers would still need a nil check")
+	}
+	if m.HasSession("anything") {
+		t.Error("HasSession on a disabled manager reported true")
+	}
+	if n := m.LiveSessions(); n != 0 {
+		t.Errorf("LiveSessions on a disabled manager = %d, want 0", n)
+	}
+	if _, err := m.Spawn("s1", []string{"sh", "-c", "true"}, nil, 80, 24); err == nil {
+		t.Error("Spawn on a disabled manager succeeded — nothing is actually hosting it")
+	}
+	m.KillServer() // must not panic
 }

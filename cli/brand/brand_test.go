@@ -3,9 +3,23 @@ package brand
 import (
 	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"testing"
 )
+
+// setHome overrides the current user's home directory for the duration of the test, on whichever
+// platform's own convention os.UserHomeDir actually reads: $HOME everywhere except Windows, where
+// it is %USERPROFILE% instead. Setting only HOME leaves a Windows test reading the real runner's
+// profile dir, not the fake one — that mismatch, not a RuntimePath bug, is what a naive HOME-only
+// t.Setenv would fail on there.
+func setHome(t *testing.T, dir string) {
+	t.Helper()
+	t.Setenv("HOME", dir)
+	if runtime.GOOS == "windows" {
+		t.Setenv("USERPROFILE", dir)
+	}
+}
 
 // The socket lived in /tmp until a reboot proved twice why it must not.
 //
@@ -28,7 +42,7 @@ func TestRuntimePathPrefersTheRuntimeDir(t *testing.T) {
 func TestRuntimePathFallsBackToHomeNotTmp(t *testing.T) {
 	t.Setenv("XDG_RUNTIME_DIR", filepath.Join(t.TempDir(), "not-there"))
 	home := t.TempDir()
-	t.Setenv("HOME", home)
+	setHome(t, home)
 
 	got := Current.RuntimePath()
 	if want := filepath.Join(home, ".local", "state", Current.RuntimeDir); got != want {
@@ -39,7 +53,7 @@ func TestRuntimePathFallsBackToHomeNotTmp(t *testing.T) {
 // And with neither, it still returns something rather than failing to start.
 func TestRuntimePathStillAnswersWithNothingSet(t *testing.T) {
 	t.Setenv("XDG_RUNTIME_DIR", "")
-	t.Setenv("HOME", "")
+	setHome(t, "")
 	if got := Current.RuntimePath(); got == "" {
 		t.Fatal("returned no path at all")
 	}
