@@ -17,6 +17,8 @@
 #   installer       a real Claude Code, latest. Advisory: when Anthropic ships a change to the
 #                   first-run wizard or the permission gates, this is the leg that says so — which
 #                   is intelligence worth having rather than a reason to block a merge.
+#   pi:<version>    a real pi at a pinned version, driven by a mock OpenAI API. Pinned, for the
+#                   same reason as the Claude one.
 #
 # The real legs assert the thing only they can: that the driver gets a real Claude Code all the way
 # to a working prompt, and that a message sent to it is acted on. No AI is involved — the model is a
@@ -96,36 +98,86 @@ pass "enrolled as $MACHINE"
 # the paste, the pty — runs exactly as in production, while the part that would make the test slow,
 # costly and non-deterministic is replaced by an expectation.
 if [ "$LEG" != "fake" ]; then
-  step "install Claude Code ($LEG) and a mock Anthropic API"
   export NPM_CONFIG_PREFIX="$WORK/npm"
   export PATH="$NPM_CONFIG_PREFIX/bin:$PATH"
-  case "$LEG" in
-    npm:*) npm install -g --silent "@anthropic-ai/claude-code@${LEG#npm:}" >/dev/null ;;
-    installer) curl -fsSL https://claude.ai/install.sh | bash >/dev/null 2>&1
-               export PATH="$HOME/.local/bin:$PATH" ;;
-    *) fail "unknown leg: $LEG" ;;
-  esac
-  command -v claude >/dev/null || fail "Claude Code did not install"
-  echo "claude: $(claude --version 2>&1 | head -1)"
 
   docker rm -f "$MOCK_CT" >/dev/null 2>&1 || true
-  # 7.5.0 or newer: `httpLlmResponse` — MockServer's Anthropic emulation — does not exist before it,
+  # 7.5.0 or newer: `httpLlmResponse` — MockServer's LLM emulation — does not exist before it,
   # and an older image answers the expectation with a 400 that says nothing about why.
   docker run -d --name "$MOCK_CT" -p 1080:1080 mockserver/mockserver:mockserver-7.5.0 >/dev/null
   for _ in $(seq 1 60); do
     curl -fsS -X PUT "http://127.0.0.1:1080/mockserver/status" >/dev/null 2>&1 && break
     sleep 1
   done
-  pass "Claude Code installed, mock API up"
 
-  # Script the model. Two details here were paid for the hard way:
-  #   * the tool list is matched with a JSON path, because Claude Code also asks this endpoint for a
-  #     session title, with no tools at all — a once-only expectation is spent on that instead;
-  #   * `streaming` is not optional: a non-streamed tool call is silently ignored, which looks
-  #     exactly like nothing happening.
-  MARK="claude-said-$RANDOM"
-  REPLY_FILE="$WORK/claude-reply.txt"
-  curl -fsS -X PUT "http://127.0.0.1:1080/mockserver/expectation" \
+  if [ "${LEG#pi:}" != "$LEG" ]; then
+    # --- pi: a real pi at a pinned version, against a mock OpenAI API ---------------------------
+    step "install pi ($LEG) and a mock OpenAI API"
+    npm install -g --silent "@earendil-works/pi-coding-agent@${LEG#pi:}" >/dev/null
+    command -v pi >/dev/null || fail "pi did not install"
+    echo "pi: $(pi --version 2>&1 | head -1)"
+    pass "pi installed, mock API up"
+
+    # pi's model is a config file, not an environment variable: one OpenAI-compatible provider
+    # pointed at the mock is all a session needs to be usable. Written into this run's own HOME,
+    # exactly as the operator's config lives on a real machine.
+    mkdir -p "$WORK/home/.pi/agent"
+    cat > "$WORK/home/.pi/agent/models.json" <<JSON
+{ "providers": { "mtmock": { "name": "Mock OpenAI",
+    "baseUrl": "http://127.0.0.1:1080/v1", "api": "openai-completions", "apiKey": "mock",
+    "models": [ { "id": "mock-1", "name": "Mock 1", "input": ["text"],
+      "contextWindow": 100000, "maxTokens": 4096,
+      "cost": { "input": 0, "output": 0, "cacheRead": 0, "cacheWrite": 0 } } ] } } }
+JSON
+    # Script the model, the same way as the Claude leg: one once-only expectation that answers
+    # with a tool call — streaming, because a non-streamed tool call is silently ignored — and a
+    # catch-all that ends the turn.
+    MARK="pi-said-$RANDOM"
+    REPLY_FILE="$WORK/pi-reply.txt"
+    MOCK_PATH="/v1/chat/completions"
+    PROG_NAME="pi"
+    curl -fsS -X PUT "http://127.0.0.1:1080/mockserver/expectation" \
+      -H 'Content-Type: application/json' --data-binary @- >/dev/null <<JSON
+{ "httpRequest": { "method": "POST", "path": "/v1/chat/completions" },
+  "times": { "remainingTimes": 1, "unlimited": false },
+  "priority": 10,
+  "httpLlmResponse": { "provider": "OPENAI", "model": "mock-1",
+    "completion": { "text": "", "streaming": true, "stopReason": "tool_calls",
+      "toolCalls": [ { "id": "call_1", "name": "bash",
+        "arguments": "{\"command\":\"echo $MARK > $REPLY_FILE\"}" } ],
+      "usage": { "inputTokens": 10, "outputTokens": 5 } } } }
+JSON
+    curl -fsS -X PUT "http://127.0.0.1:1080/mockserver/expectation" \
+      -H 'Content-Type: application/json' --data-binary @- >/dev/null <<'JSON'
+{ "httpRequest": { "method": "POST", "path": "/v1/chat/completions" },
+  "priority": 1,
+  "httpLlmResponse": { "provider": "OPENAI", "model": "mock-1",
+    "completion": { "text": "done", "streaming": true, "stopReason": "stop",
+                    "usage": { "inputTokens": 10, "outputTokens": 2 } } } }
+JSON
+  else
+    # --- Claude Code, as before ---------------------------------------------------------------
+    step "install Claude Code ($LEG) and a mock Anthropic API"
+    case "$LEG" in
+      npm:*) npm install -g --silent "@anthropic-ai/claude-code@${LEG#npm:}" >/dev/null ;;
+      installer) curl -fsSL https://claude.ai/install.sh | bash >/dev/null 2>&1
+                 export PATH="$HOME/.local/bin:$PATH" ;;
+      *) fail "unknown leg: $LEG" ;;
+    esac
+    command -v claude >/dev/null || fail "Claude Code did not install"
+    echo "claude: $(claude --version 2>&1 | head -1)"
+    pass "Claude Code installed, mock API up"
+
+    # Two details here were paid for the hard way:
+    #   * the tool list is matched with a JSON path, because Claude Code also asks this endpoint for a
+    #     session title, with no tools at all — a once-only expectation is spent on that instead;
+    #   * `streaming` is not optional: a non-streamed tool call is silently ignored, which looks
+    #     exactly like nothing happening.
+    MARK="claude-said-$RANDOM"
+    REPLY_FILE="$WORK/claude-reply.txt"
+    MOCK_PATH="/v1/messages"
+    PROG_NAME="Claude Code"
+    curl -fsS -X PUT "http://127.0.0.1:1080/mockserver/expectation" \
     -H 'Content-Type: application/json' --data-binary @- >/dev/null <<JSON
 { "httpRequest": { "method": "POST", "path": "/v1/messages",
                    "body": { "type": "JSON_PATH", "jsonPath": "\$.tools[?(@.name=='Bash')]" } },
@@ -145,14 +197,26 @@ JSON
     "completion": { "text": "done", "streaming": true, "stopReason": "end_turn",
                     "usage": { "inputTokens": 30, "outputTokens": 3 } } } }
 JSON
+  fi
 fi
 
 step "open a screen, and let the applet announce itself"
 HEARD="$WORK/heard.txt"; : >"$HEARD"
 if [ "$LEG" = "fake" ]; then
+  APPLET="claude"
   PROGRAM="while IFS= read -r line; do printf '%s\n' \"\$line\" >> $HEARD; done"
   SCREEN_ENV='{}'
+elif [ "${LEG#pi:}" != "$LEG" ]; then
+  APPLET="pi"
+  # An absolute path, not the name: the program is started through a login shell, which re-reads the
+  # profile and rebuilds PATH — so a PATH handed down as screen environment does not survive. The
+  # symptom is "Pane is dead (status 127)", which says nothing about why. (Node itself is found by
+  # the login shell; only the pi binary lives in this run's npm prefix.)
+  PI_BIN="$(command -v pi)"
+  PROGRAM="cd $WORK && exec $PI_BIN"
+  SCREEN_ENV="{\"HOME\":\"$WORK/home\",\"PATH\":\"$PATH\",\"NO_PROXY\":\"127.0.0.1,localhost\",\"no_proxy\":\"127.0.0.1,localhost\"}"
 else
+  APPLET="claude"
   # API mode: a base URL and a token are all Claude Code needs to skip login entirely, which is what
   # makes a real Claude Code testable at all without an account. HOME is this run's own, so the
   # first-run wizard and the permission gate appear exactly as they do on a brand-new machine —
@@ -170,37 +234,37 @@ else
   # rather than "your environment routed it away".
   SCREEN_ENV="{\"HOME\":\"$WORK/home\",\"ANTHROPIC_BASE_URL\":\"http://127.0.0.1:1080\",\"ANTHROPIC_AUTH_TOKEN\":\"mock\",\"ANTHROPIC_MODEL\":\"claude-sonnet-4-5\",\"PATH\":\"$PATH\",\"NO_PROXY\":\"127.0.0.1,localhost\",\"no_proxy\":\"127.0.0.1,localhost\"}"
 fi
-python3 - "$MACHINE" "$SID" "$PROGRAM" "$SCREEN_ENV" > "$WORK/open.json" <<'PY'
+python3 - "$MACHINE" "$SID" "$PROGRAM" "$SCREEN_ENV" "$APPLET" > "$WORK/open.json" <<'PY'
 import json, sys
-machine, sid, program, env = sys.argv[1:5]
-print(json.dumps({"machine": machine, "sid": sid, "applet": "claude",
+machine, sid, program, env, applet = sys.argv[1:6]
+print(json.dumps({"machine": machine, "sid": sid, "applet": "" + applet,
                   "command": ["bash", "-lc", program], "env": json.loads(env)}))
 PY
 curl -fsS -X POST "$BASE/test/open" -H 'Content-Type: application/json' --data-binary @"$WORK/open.json" >/dev/null
 for _ in $(seq 1 60); do
   READY="$(curl -fsS "$BASE/test/state" | python3 -c "import json,sys;print(json.load(sys.stdin)['screens'].get('$SID',{}).get('driver',''))")"
-  [ "$READY" = "claude" ] && break
+  [ "$READY" = "$APPLET" ] && break
   sleep 0.5
 done
-[ "${READY:-}" = "claude" ] || { cat "$WORK/conn.log"; fail "the applet never announced itself (screenReady)"; }
-pass "the screen is live and the applet says it is the claude driver"
+[ "${READY:-}" = "$APPLET" ] || { cat "$WORK/conn.log"; fail "the applet never announced itself (screenReady)"; }
+pass "the screen is live and the applet says it is the $APPLET driver"
 
 if [ "$LEG" != "fake" ]; then
-  step "let Claude Code reach a working prompt"
+  step "let $PROG_NAME reach a working prompt"
   # Assert on the driver's own opinion rather than on the screen: what is under test is whether it
   # understands what it is looking at, so what it believes is the thing worth checking. A dead
   # status here means a gate was answered wrongly — the failure that killed the first agent on every
   # brand-new machine.
   for _ in $(seq 1 90); do
     ST="$(curl -fsS "$BASE/test/state" | python3 -c "import json,sys;print(json.load(sys.stdin)['screens'].get('$SID',{}).get('vars',{}).get('status',''))")"
-    [ "$ST" = "dead" ] && { echo "--- connector ---"; cat "$WORK/conn.log"; echo "--- the pane ---"; pane; fail "Claude Code exited during startup — a gate was answered wrongly"; }
+    [ "$ST" = "dead" ] && { echo "--- connector ---"; cat "$WORK/conn.log"; echo "--- the pane ---"; pane; fail "$PROG_NAME exited during startup — a gate was answered wrongly"; }
     [ "$ST" = "idle" ] || [ "$ST" = "busy" ] && break
     sleep 1
   done
   case "${ST:-}" in
-    idle | busy) pass "the driver got Claude Code through its gates to a working prompt" ;;
+    idle | busy) pass "the driver got $PROG_NAME through its gates to a working prompt" ;;
     *) echo "--- connector ---"; cat "$WORK/conn.log"; echo "--- the pane ---"; pane
-       fail "Claude Code never reached a prompt (status=${ST:-none})" ;;
+       fail "$PROG_NAME never reached a prompt (status=${ST:-none})" ;;
   esac
 fi
 
@@ -228,11 +292,11 @@ else
     echo "--- connector ---"; cat "$WORK/conn.log"
     echo "--- the pane ---"; pane
     echo "--- what the model was asked ---"
-    curl -s -X PUT "http://127.0.0.1:1080/mockserver/retrieve?type=REQUESTS&format=JSON" -d '{"path":"/v1/messages"}' | head -c 1500
-    fail "Claude Code never acted on the message (its Enter, or the whole turn, was lost)"
+    curl -s -X PUT "http://127.0.0.1:1080/mockserver/retrieve?type=REQUESTS&format=JSON" -d "{\"path\":\"$MOCK_PATH\"}" | head -c 1500
+    fail "$PROG_NAME never acted on the message (its Enter, or the whole turn, was lost)"
   }
   grep -q "$MARK" "$REPLY_FILE" || fail "the tool ran, but wrote something unexpected"
-  pass "a real Claude Code took the message and ran the tool call it was answered with"
+  pass "a real $PROG_NAME took the message and ran the tool call it was answered with"
 fi
 
 step "everything asserted"
