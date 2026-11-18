@@ -33,6 +33,9 @@ cd "$ROOT"
 
 VERSION_FILE="$ROOT/VERSION"
 APPLETS_PKG="$ROOT/applets/package.json"
+# npm keeps the package's own version in the lock file too, twice; a lock that names another
+# version than its package is one more number that is believed and wrong.
+APPLETS_LOCK="$ROOT/applets/package-lock.json"
 GO_VERSION="$ROOT/cli/version.go"
 
 # Prereleases are allowed and are how a version is offered before it is promised: 0.1.0-rc1 ships
@@ -41,6 +44,7 @@ semver_re='^[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.]+)?$'
 read_current() { tr -d '[:space:]' < "$VERSION_FILE"; }
 
 pkg_version() { node -p "require('$APPLETS_PKG').version" 2>/dev/null || echo "(node unavailable)"; }
+lock_version() { node -p "const l=require('$APPLETS_LOCK'); l.version===l.packages[''].version ? l.version : 'inconsistent'" 2>/dev/null || echo "(node unavailable)"; }
 go_version() { perl -ne 'print "$1\n" if /^const Version = "([^"]+)"/' "$GO_VERSION"; }
 
 if [[ "${1:-}" == "--tags" ]]; then
@@ -60,6 +64,7 @@ if [[ $# -eq 0 ]]; then
   echo
   echo "as found in each file:"
   printf '  %-28s %s\n' "applets/package.json" "$(pkg_version)"
+  printf '  %-28s %s\n' "applets/package-lock.json" "$(lock_version)"
   printf '  %-28s %s\n' "cli/version.go"       "$(go_version)"
   echo
   echo "independent (NOT touched by this script):"
@@ -68,6 +73,7 @@ if [[ $# -eq 0 ]]; then
   printf '  %-28s %s\n' "mock server image"     "$(perl -ne 'print "$1\n" if /mockserver\/mockserver:(\S+) /' testbed/e2e.sh)"
   ok=1
   [[ "$(pkg_version)" == "$cur" ]] || { echo "MISMATCH: applets/package.json"; ok=0; }
+  [[ "$(lock_version)" == "$cur" ]] || { echo "MISMATCH: applets/package-lock.json"; ok=0; }
   [[ "$(go_version)" == "$cur" ]] || { echo "MISMATCH: cli/version.go"; ok=0; }
   [[ "$ok" == 1 ]] || exit 1
   exit 0
@@ -80,6 +86,7 @@ echo "setting version -> $new"
 
 printf '%s\n' "$new" > "$VERSION_FILE"
 node -e "const f='$APPLETS_PKG';const p=require(f);p.version='$new';require('fs').writeFileSync(f, JSON.stringify(p,null,2)+'\n')"
+node -e "const f='$APPLETS_LOCK';const l=require(f);l.version='$new';l.packages[''].version='$new';require('fs').writeFileSync(f, JSON.stringify(l,null,2)+'\n')"
 perl -i -pe "s{^(const Version = \")[^\"]+(\")}{\${1}$new\${2}}" "$GO_VERSION"
 
 echo "done. verifying:"
