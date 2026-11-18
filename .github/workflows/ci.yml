@@ -41,7 +41,7 @@ jobs:
         working-directory: cli
     steps:
       - uses: actions/checkout@v7
-      - uses: actions/setup-go@v5
+      - uses: actions/setup-go@v6
         with:
           go-version-file: cli/go.mod
       - name: Test
@@ -67,7 +67,7 @@ jobs:
         working-directory: cli
     steps:
       - uses: actions/checkout@v7
-      - uses: actions/setup-go@v5
+      - uses: actions/setup-go@v6
         with:
           go-version-file: cli/go.mod
       - name: Test
@@ -91,7 +91,7 @@ jobs:
         working-directory: cli
     steps:
       - uses: actions/checkout@v7
-      - uses: actions/setup-go@v5
+      - uses: actions/setup-go@v6
         with:
           go-version-file: cli/go.mod
       - name: Test
@@ -143,7 +143,7 @@ jobs:
       - uses: actions/setup-node@v4
         with:
           node-version: "22"
-      - uses: actions/setup-go@v5
+      - uses: actions/setup-go@v6
         with:
           go-version-file: cli/go.mod
       - uses: actions/setup-java@v6
