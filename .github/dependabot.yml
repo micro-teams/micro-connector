@@ -1,0 +1,39 @@
+# Keeps the connector's third-party dependencies current. Weekly, and minor and patch releases of one
+# ecosystem arrive together as one PR; a major release comes on its own, because it is the one that
+# can break the build and deserves its own red CI.
+#
+# Not here, on purpose: the Claude Code version CI drives, the MockServer image and the Go toolchain
+# are pinned in the workflows as versions we chose to sit on (see CLAUDE.md, "Versions"); moving
+# them is a decision, not an update.
+version: 2
+updates:
+  - package-ecosystem: 'gomod'
+    directory: '/cli'
+    schedule:
+      interval: 'weekly'
+    groups:
+      cli-minor:
+        update-types: ['minor', 'patch']
+
+  # The testbed's own module: it replaces the cli module with ../../cli, so only its other
+  # dependencies move here.
+  - package-ecosystem: 'gomod'
+    directory: '/testbed/cli'
+    schedule:
+      interval: 'weekly'
+    groups:
+      testbed-minor:
+        update-types: ['minor', 'patch']
+
+  - package-ecosystem: 'npm'
+    directory: '/applets'
+    schedule:
+      interval: 'weekly'
+    groups:
+      applets-minor:
+        update-types: ['minor', 'patch']
+
+  - package-ecosystem: 'github-actions'
+    directory: '/'
+    schedule:
+      interval: 'weekly'
