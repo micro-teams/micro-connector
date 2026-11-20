@@ -3,16 +3,24 @@
 The screen engine and the program declarations that micro-connector serves to a machine: one
 self-contained JavaScript file per program, built for the goja runtime the connector embeds.
 
-A control plane installs this package and serves `dist/claude.js` (or `dist/codex.js`) to a
-connector, which runs it against a real terminal. Nothing here talks to a network or a filesystem —
-the host provides a terminal, mirrored variables and two directions of function call, and that is
-the whole of it.
+A control plane serves `dist/<program>.js` to a connector, which runs it against a real terminal.
+Nothing here talks to a network or a filesystem: the host provides a terminal, mirrored variables
+and two directions of function call (see `src/engine/host.ts`).
 
-## Why it is a package
+## Drivers
 
-Understanding what a coding agent's terminal is showing you is the expensive part of driving one,
-and it goes stale every time that agent ships a release. Publishing it means a fix is made once and
-taken by everyone, instead of each product discovering the same changed dialog on its own.
+| file | program | commands besides `snapshot` and `say(text, id?)` |
+|---|---|---|
+| `claude.js` | Claude Code | `choose(n)`, `compact`, `usage`, `login` |
+| `codex.js` | Codex | `usage` |
+| `pi.js` | pi | |
+| `dsh.js` | an ACP agent behind `acp-screen` | `interrupt` |
+
+Every driver mirrors `status` (`starting`, `busy`, `waiting`, `idle`, `dead`), `elapsed`, `tokens`,
+`question` and `choices`. `say` queues the text; it is pasted once the program shows its prompt and
+submitted two frames later, and when it was given an id the driver calls the control plane's
+`sayResult({id, ok, error})`. Build the drivers from the same release as the connector that runs
+them.
 
 ## Use
 
@@ -40,7 +48,7 @@ Versions published from `main` carry a `-main.<n>` prerelease suffix and the `de
 ## Develop
 
 ```
-npm run typecheck && npm test    # the tests run the built artifact, in a fresh scope, as goja does
+npm run typecheck && npm test    # the tests run the built files, each in a fresh scope, as goja does
 npm run build
 ```
 

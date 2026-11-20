@@ -1,112 +1,127 @@
 # micro-connector
 
-A machine-side connector that lets a control plane run **terminal screens** and **applets** on
-machines it cannot SSH into. The machine dials out; nothing dials in.
+micro-connector lets a control plane (a web service) run **terminal programs on machines it cannot
+reach**, and lets people watch and type into them from anywhere. The machine dials out over one
+WebSocket; nothing dials in. Each program runs in tmux on the machine, so it survives the connector
+restarting, updating or crashing, and an **applet** (JavaScript the control plane supplies) drives it:
+answering its dialogs, typing messages into it, and reporting what state it is in.
 
-It is the shared core of three products that each grew their own copy — MicroTeams, CCProxy and
-cheese — pulled into one place so the expensive part is maintained once.
+It is built for coding agents (Claude Code, Codex, pi and ACP agents are supported out of the box),
+but nothing in it is specific to them or to any one product.
 
-## What is actually expensive here
-
-Not the Go. `runtime` + `terminal` + `config` + `update` are about two thousand lines and anyone
-could write them again. The expensive part is **understanding what a coding agent's terminal is
-showing you**, and the tests that prove you still understand it after the next release. Everything
-in that category was learned the hard way, on real machines:
-
-| What happened | What it taught |
-|---|---|
-| On a brand-new machine Claude Code adds a bypass-permissions gate whose default is `No, exit` | Gates that never appear on an old machine still kill new ones |
-| Aiming at "Yes, I accept" reliably pressed "No, exit" | **The option list wraps.** Absolute cursor positioning cannot work; only relative movement can |
-| A same-frame Enter landed on the option we were leaving | Move and confirm must be split across frames |
-| A pasted message was never submitted; the pane looked perfect | The Enter after a paste has to be deferred, and only a reply proves it landed |
-| A 25KB message silently vanished | `tmux send-keys` refuses long commands; writes must be chunked, never splitting a rune |
-| A screen whose tmux had died still read as alive | The applet runtime outlives the session it drives — something must confirm and report |
-
-None of that is derivable from documentation. It is why this repository exists, and why its CI
-drives a **real Claude Code** against a mock model rather than a fake program against a fake server.
-
-## Layout
-
-```
-applets/    the screen engine + per-program declarations (claude, codex), built to JS
-cli/        the Go library: terminal, runtime, screens, enrolment, credentials, self-update
-testbed/    a reference control plane, a connector made only of the library, and their e2e
-docs/       the contract between a control plane and a connector
-.github/    the tests: real tmux, real Claude Code, mock model, matrixed by version
+```mermaid
+flowchart LR
+  subgraph cp[Control plane]
+    S[your server]
+  end
+  subgraph m[Machine]
+    C[connector<br/>built from cli/]
+    T[(tmux server)]
+    A[applet<br/>driver from applets/]
+    P[program<br/>e.g. Claude Code]
+  end
+  V1[viewer] --- S
+  V2[viewer] --- S
+  C -- "one outbound WebSocket" --> S
+  C --> T
+  T --> P
+  A -- "read screen / write input" --> C
 ```
 
-Implementing a control plane? [`docs/protocol.md`](docs/protocol.md) is the specification, and
-[`testbed/server`](testbed/server/main.go) is the same thing you can run.
+## What you get
 
-## Using it
+- **Screens.** `session.create` starts a program in its own tmux session; the connector reports
+  `session.ready` or `session.error`, and re-adopts running sessions after it restarts.
+- **Viewers.** Every person watching gets their own tmux client, so each one opens fully drawn and
+  catches up after falling behind without slowing anyone else. The terminal takes the smallest size
+  among the viewers and tells each of them the size, so clients can centre it.
+- **One typist at a time.** Input goes through a lease: a free terminal is taken by the first
+  keystroke, held while the person keeps typing, and lapses after 3 s. The applet takes the same
+  lease around a paste and its Enter, so a person and an agent driver never interleave keys.
+- **Scrolling and copying through tmux.** The mouse wheel scrolls tmux's history (or reaches a
+  full-screen program that asked for the mouse); `screen.capture` returns the text with history.
+- **Drivers.** `applets/` holds the engine and one declaration per program: its startup dialogs,
+  how to tell working from idle, and commands such as `compact` and `usage`. The engine types a
+  message only once the program shows its prompt and reports whether it was submitted.
+- **Lifecycle.** Install as a service (systemd, launchd, OpenRC, Windows), enrol with a code a person
+  approves, update in place by downloading and re-executing; screens survive all of it.
 
-Two artifacts, versioned together, because a screen driver and the host that runs it are only ever
-tested as a pair.
+## Repository
 
-**The Go library** — build a connector for your own product:
+```
+cli/       the Go library a connector is built from (see cli/README.md)
+applets/   the driver engine and the program declarations, built to one JS file each
+testbed/   a reference control plane and a minimal connector, and the end-to-end test that runs
+           real programs (Claude Code, pi) through them against a mock model
+docs/      protocol.md, the contract between a control plane and a connector
+```
+
+## Build a connector
 
 ```bash
-go get github.com/micro-teams/micro-connector/cli@v0.1.0
+go get github.com/micro-teams/micro-connector/cli@latest
 ```
 
 ```go
-brand.Current = brand.Brand{Name: "yourthing", EnvPrefix: "YOURTHING", /* … */}
+brand.Current = brand.Brand{Name: "yourthing", EnvPrefix: "YOURTHING", ConfigDir: "yourthing",
+	RuntimeDir: "yourthing", ServiceName: "yourthing", EnrollBase: "/machine/enroll",
+	BinaryBase: "/connector/latest"}
 
-tm, _ := terminal.NewManager()
-conn := ws.New(controlURL, token, apiBase)
+res, err := auth.Login(ctx, base, func(url string) { fmt.Println("approve at", url) })
+tm, err := terminal.NewManager()
+conn := ws.New(linkURL, res.Token, base)
 mgr := screen.NewManager(ctx, conn, tm)
-_ = conn.Run(ctx, mgr.Dispatch)
+defer mgr.Detach() // leaves every screen running
+conn.Run(ctx, mgr.Dispatch)
 ```
 
-[`testbed/connector`](testbed/connector/main.go) is a complete working connector in 70 lines, and exists to keep that claim honest.
+[`testbed/connector`](testbed/connector/main.go) is a complete connector in about 70 lines.
+`service`, `update`, `config` and `apiauth` add the service install, self-update, a config file and
+authenticated API calls; every package's file headers document its whole interface.
 
-**The screen drivers** — serve them from your control plane:
+## Implement a control plane
+
+[`docs/protocol.md`](docs/protocol.md) is the specification: enrolment, the messages, viewers, the
+input lease and the rules a control plane must keep. [`testbed/server`](testbed/server/main.go) is a
+reference control plane in a few hundred lines of Go that the end-to-end test runs against.
+
+Serve the drivers from `applets/dist/<program>.js` as a screen's applet. Build them from the same
+release as the connector you ship: a driver and the connector that runs it are tested as a pair.
+They are also published as `@micro-teams/connector-applets` on GitHub Packages (needs
+`@micro-teams:registry=https://npm.pkg.github.com` in `.npmrc`).
+
+## Platforms
+
+| | screens | service |
+|---|---|---|
+| Linux | yes (tmux, found via `<PREFIX>_TMUX`, `<config>/<brand>/bin/tmux`, then `PATH`) | systemd (user or system unit), OpenRC |
+| macOS | yes | launchd (LaunchAgent or LaunchDaemon) |
+| WSL2 | yes | systemd, after `service.EnsureSystemd` turns it on and WSL restarts |
+| Windows | no (`terminal.ErrUnsupported`: no pty) | Windows service (administrator) |
+
+All four are tested in CI.
+
+## Versions
+
+`VERSION` is the single source of the release number; `scripts/version.sh` reads it, checks that
+every file agrees, sets a new one (`scripts/version.sh X.Y.Z`) and prints the release commands
+(`--tags`). The Go library is released by the tag `cli/v<version>` (Go's rule for a module in a
+subdirectory) and the drivers by `applets-v<version>`, together. A prerelease (`X.Y.Z-rc.N`) is
+published under its own dist-tag, never `latest`; every merge to `main` publishes
+`<version>-main.<run>` under `dev`.
+
+The wire protocol has its own number (`protocol.Version`, now 2): it changes only when an older peer
+could not survive the message set.
+
+## Develop
 
 ```bash
-npm install @micro-teams/connector-applets@0.1.0
+(cd cli && go vet ./... && go test -race ./...)     # real tmux, isolated per test
+(cd applets && npm ci && npm run typecheck && npm test)
+bash testbed/e2e.sh fake                            # or npm:<claude version>, pi:<version>
 ```
 
-The package is published to GitHub Packages, so your `.npmrc` needs
-`@micro-teams:registry=https://npm.pkg.github.com`. Serve `dist/claude.js` (or `codex.js`) to a
-connector as a screen's applet; it is the same file this repository's CI drives a real Claude Code
-with.
-
-## Platform support
-
-Linux, macOS and native Windows are all CI-tested (`.github/workflows/ci.yml`'s `go`, `go-macos` and
-`go-windows` jobs) — "should work unchanged" is a tested claim on all three, not an assumption.
-macOS runs the exact same suite as Linux (real tmux via Homebrew, `-race` included): unlike Windows,
-its pty layer is real, so screens work there too.
-
-**WSL2** is Linux to everything in this repo (`runtime.GOOS == "linux"`), but WSL2 does not run
-systemd as its PID 1 unless a distro opts in — without that, `service.New`'s systemd --user install
-fails outright. Call `service.EnsureSystemd()` before installing: off WSL it is a no-op
-(`SystemdNotApplicable`); on WSL with systemd already active it is also a no-op (`SystemdActive`);
-otherwise it flips wsl.conf's `[boot] systemd` key (a boolean, safe to set unconditionally — never
-its free-text `command` key, which may already hold a user's own boot script) and returns
-`SystemdNeedsRestart`, since nothing inside the current WSL session can make that take effect —
-the operator has to run `wsl --shutdown` from Windows and reopen the distro.
-
-**Native Windows** has no per-user service: `service.New` always installs a system-level Windows
-service there (needs an elevated/"Run as administrator" process — there is no unprivileged
-fallback), and screens are unavailable outright. `terminal.NewManager` returns `terminal.
-ErrUnsupported` immediately on Windows rather than searching for a `tmux.exe` that would not help
-regardless — the pty layer underneath (`github.com/creack/pty`) has no Windows implementation, so no
-tmux binary on that platform makes screens work. Everything else — enrolment, the control
-connection and self-update — is unaffected; a product built on this library treats
-`ErrUnsupported` as "this machine cannot host a screen," not as a fatal error.
-
-## Status
-
-0.1.0. One product — MicroTeams — is built on it and runs it in production, with its own end-to-end
-tests over the top; a second (CCProxy) is starting. Being 0.x, interfaces may still move: the
-driver-declaration shape is the most likely to, once a second consumer's needs are real rather than
-anticipated.
-
-The **wire protocol** is versioned separately and is at **1**. It changes only when an older peer
-could not survive the message set, which is rarer than a release — see
-[`docs/protocol.md`](docs/protocol.md), the specification, with a runnable reference implementation
-beside it in [`testbed/server`](testbed/server/main.go).
+Read [AGENTS.md](AGENTS.md) before changing anything; it holds the rules for this repository.
 
 ## License
 
