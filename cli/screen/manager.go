@@ -138,7 +138,7 @@ func (m *Manager) handle(msg protocol.Msg) {
 	case "screen.unsubscribe":
 		m.unsubscribe(s, msg.Viewer)
 	case "screen.input":
-		m.input(s, msg.Viewer, msg.Data)
+		m.input(s, msg.Viewer, msg.Data, msg.Op == "reply")
 	case "screen.ack":
 		m.ack(s, msg.Viewer, msg.N)
 	case "screen.lease":
@@ -150,9 +150,8 @@ func (m *Manager) handle(msg protocol.Msg) {
 
 // create starts a screen, or re-adopts one that is already running.
 func (m *Manager) create(msg protocol.Msg) {
-	alive, err := m.hasSession(msg.Sid)
-	if err != nil {
-		m.send(protocol.Msg{T: "session.error", Sid: msg.Sid, Error: err.Error()})
+	alive := m.hasSession(msg.Sid)
+	if m.ctx.Err() != nil {
 		return
 	}
 	if s := m.screen(msg.Sid); s != nil {
@@ -213,17 +212,26 @@ func (m *Manager) create(msg protocol.Msg) {
 	m.publishState()
 }
 
-// hasSession asks tmux, retrying a few times: one failed call is a busy tmux, not an answer.
-func (m *Manager) hasSession(sid string) (bool, error) {
-	var err error
-	for i := 0; i < 3; i++ {
-		var ok bool
-		if ok, err = m.tm.HasSession(sid); err == nil {
-			return ok, nil
+// hasSession asks tmux until it answers. A failed call is a busy or briefly unreachable tmux, not
+// an answer, and reporting it as one would make the control plane treat a running program as gone.
+// Only this screen's queue waits meanwhile.
+func (m *Manager) hasSession(sid string) bool {
+	wait := 200 * time.Millisecond
+	for {
+		ok, err := m.tm.HasSession(sid)
+		if err == nil {
+			return ok
 		}
-		time.Sleep(200 * time.Millisecond)
+		fmt.Fprintf(os.Stderr, "%s: screen %s: tmux did not answer (%v); asking again in %s\n", brand.Current.Name, sid, err, wait)
+		select {
+		case <-m.ctx.Done():
+			return false
+		case <-time.After(wait):
+		}
+		if wait < 5*time.Second {
+			wait *= 2
+		}
 	}
-	return false, err
 }
 
 // environment is the program's environment: the screen's identity token, a private temp

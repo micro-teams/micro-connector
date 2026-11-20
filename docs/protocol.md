@@ -67,7 +67,7 @@ A screen is a program in a terminal on the machine, identified by a control-plan
 | `screen.subscribe` | `sid`, `viewer`, `cols`, `rows` | Attach a viewer whose view has room for `cols` x `rows`. It gets its own tmux client: `screen.size`, then `screen.data` with a complete paint. |
 | `screen.resize` | `sid`, `viewer`, `cols`, `rows` | The room a viewer has changed. |
 | `screen.unsubscribe` | `sid`, `viewer` | Detach the viewer. The program is untouched. |
-| `screen.input` | `sid`, `viewer`, `data` | Base64 input from a viewer: keys, pastes, and mouse sequences (the wheel scrolls). Subject to the input lease. |
+| `screen.input` | `sid`, `viewer`, `data`, `op` | Base64 input from a viewer: keys, pastes, and mouse sequences (the wheel scrolls). Subject to the input lease, except with `op` `reply`: the viewer terminal's answers to tmux's queries (device attributes, cursor position), which tmux consumes. The lease coordinates people who trust each other; it is not access control. |
 | `screen.ack` | `sid`, `viewer`, `n` | The viewer has rendered `n` more bytes of `screen.data`. |
 | `screen.lease` | `sid`, `viewer`, `op` | `take`, `renew` or `release` the input lease. |
 | `screen.capture` | `sid`, `viewer`, `id` | Ask for the screen's text. Answered with `screen.capture.result`. |
@@ -79,7 +79,7 @@ A screen is a program in a terminal on the machine, identified by a control-plan
 | `t` | fields | meaning |
 |---|---|---|
 | `session.ready` | `sid` | The screen exists. |
-| `session.error` | `sid`, `error` | The screen is gone or could not be made. See "A screen that dies". |
+| `session.error` | `sid`, `error` | The screen is gone or could not be made. See "A screen that dies". A tmux that does not answer is asked again, never reported as a missing screen. |
 | `var.push` | `sid`, `name`, `value` | An applet-owned variable changed. |
 | `rpc.call` | `sid`, `id`, `name`, `args` | The applet is calling the control plane. Must be answered with `rpc.result`. |
 | `rpc.result` | `sid`, `id`, `value`, `error` | The answer to a `rpc.call` from the control plane. |

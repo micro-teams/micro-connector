@@ -9,6 +9,8 @@
 //   host.expose / call        functions the control plane calls / answers
 //   host.log(message)
 //
+// Against a protocol-1 runtime (no lease) hold always succeeds.
+//
 // Example: if (host.term.hold(true)) { host.term.write('hi') }
 
 /** A script-owned variable the host mirrors up to the control plane. */
@@ -45,4 +47,16 @@ export interface Host {
 
 declare const globalThis: Record<string, any>
 
-export const host: Host = (globalThis as any).connector
+// A connector that predates the input lease (protocol 1) has no term.hold and returns nothing from
+// term.write. Its drivers have no lease to respect there, so hold always succeeds and a write
+// counts as done unless the runtime says false.
+const raw = (globalThis as any).connector
+export const host: Host = {
+  ...raw,
+  term: {
+    read: () => raw.term.read(),
+    onChange: (fn: () => void) => raw.term.onChange(fn),
+    write: (data: string) => raw.term.write(data) !== false,
+    hold: (on: boolean) => (raw.term.hold ? raw.term.hold(on) : true),
+  },
+}

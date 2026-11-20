@@ -15,6 +15,9 @@
 // while a viewer holds it. Scrolling is input too: the viewer's wheel reaches its tmux client as
 // mouse sequences, and tmux scrolls its history or passes the wheel to a program that wants it.
 //
+// screen.input with op "reply" carries the viewer terminal's answers to tmux's queries, which tmux
+// consumes, so they bypass the lease.
+//
 // screen.capture answers with the screen's text and recent history, for copying on devices where
 // selecting inside a terminal is impractical.
 package screen
@@ -251,7 +254,10 @@ func (m *Manager) refuse(s *screen, id string) {
 	m.send(protocol.Msg{T: "screen.lease.state", Sid: s.sid, Viewer: id, Holder: holder})
 }
 
-func (m *Manager) input(s *screen, id, data string) {
+// input writes a viewer's input to its client. A reply is what the viewer's terminal answers to a
+// query from tmux (device attributes, cursor position): tmux consumes it, so it neither needs nor
+// takes the lease.
+func (m *Manager) input(s *screen, id, data string, reply bool) {
 	b, err := base64.StdEncoding.DecodeString(data)
 	if err != nil {
 		m.viewerError(s.sid, id, "input is not base64: "+err.Error())
@@ -262,6 +268,13 @@ func (m *Manager) input(s *screen, id, data string) {
 	if v == nil || v.client == nil {
 		s.mu.Unlock()
 		m.viewerError(s.sid, id, "input from a viewer that is not subscribed")
+		return
+	}
+	if reply {
+		s.mu.Unlock()
+		if err := v.client.Write(b); err != nil {
+			m.viewerError(s.sid, id, err.Error())
+		}
 		return
 	}
 	granted, changed := m.take(s, id)

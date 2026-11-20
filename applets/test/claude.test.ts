@@ -6,8 +6,18 @@ import { DOWN, ENTER } from '../src/engine/keys'
 
 const PASTE_START = '\x1b[200~'
 
-function loadDriver() {
+// protocol1: a runtime from before the input lease, with no term.hold and a write that returns
+// nothing.
+function loadDriver(protocol1 = false) {
   const host = makeHost()
+  if (protocol1) {
+    const term: any = host.term
+    delete term.hold
+    const write = term.write
+    term.write = (d: string) => {
+      write(d)
+    }
+  }
   runDriver('claude')
   return host
 }
@@ -294,4 +304,12 @@ test('a message resent with the same id is typed once', () => {
   host.exposed.say('once', 'm9')
   for (let i = 0; i < 8; i++) host.frame(IDLE)
   assert.equal(host.keys().split('once').length - 1, 1)
+})
+
+test('on a runtime without the input lease, messages are still typed and submitted', () => {
+  const host = loadDriver(true)
+  host.frame(IDLE)
+  host.exposed.say('old runtime', 'm1')
+  for (let i = 0; i < 4; i++) host.frame(IDLE)
+  assert.ok(host.keys().includes('old runtime') && host.keys().endsWith(ENTER))
 })
