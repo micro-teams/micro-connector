@@ -43,23 +43,6 @@ type Msg struct {
 	// the viewer paging through the pane's tmux scrollback (copy-mode). Unknown to
 	// older peers (ignored).
 	Dir string `json:"dir,omitempty"`
-	// One-shot command execution: exec (request) / exec.cancel / exec.result.
-	Cwd       string `json:"cwd,omitempty"`
-	Stdin     string `json:"stdin,omitempty"`   // optional input fed to the command
-	Timeout   int    `json:"timeout,omitempty"` // caller's max seconds (0 = host default)
-	Stdout    string `json:"stdout,omitempty"`
-	Stderr    string `json:"stderr,omitempty"`
-	Exit      int    `json:"exit,omitempty"`
-	Truncated bool   `json:"truncated,omitempty"` // output hit the size cap and was clipped
-	// Structured, shell-free file access: file.write (request, carries Path + Data) / file.write.
-	// result (Error), file.read (request, Path) / file.read.result (Data, Error), file.remove
-	// (request, Path) / file.remove.result (Error), homedir (request, no fields) / homedir.result
-	// (Path carries the resolved directory, Error). These exist so a control plane never has to
-	// know or guess what shell (if any) is on a machine — os.WriteFile/os.ReadFile/os.UserHomeDir/
-	// os.Remove behave identically on every platform this connector targets, where "run this bash
-	// script" only ever worked on Unix. Path is also reused as the response field for homedir
-	// specifically because that IS a path, not a new dedicated field.
-	Path string `json:"path,omitempty"`
 }
 
 // Transport carries the message set. Implementations differ in everything except this: a resident

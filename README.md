@@ -93,7 +93,7 @@ fallback), and screens are unavailable outright. `terminal.NewManager` returns `
 ErrUnsupported` immediately on Windows rather than searching for a `tmux.exe` that would not help
 regardless — the pty layer underneath (`github.com/creack/pty`) has no Windows implementation, so no
 tmux binary on that platform makes screens work. Everything else — enrolment, the control
-connection, applet-free command execution — is unaffected; a product built on this library treats
+connection and self-update — is unaffected; a product built on this library treats
 `ErrUnsupported` as "this machine cannot host a screen," not as a fatal error.
 
 ## Status

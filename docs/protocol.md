@@ -60,7 +60,6 @@ A screen is a program in a terminal on the machine, identified by a control-plan
 | `t` | fields | meaning |
 |---|---|---|
 | `session.create` | `sid`, `command`, `env`, `cols`, `rows`, `source`, `screen`, `adopt` | Open a screen. If a session with this `sid` already exists on the machine, it is **adopted** rather than replaced — see below. `source` is the applet's JavaScript. `screen` is an opaque per-screen token the connector injects into the program's environment. |
-| `script.load` | `sid`, `source` | Replace the applet on a live screen. The program keeps running. This is how a fix reaches every machine without shipping a binary. |
 | `var.set` | `sid`, `name`, `value` | Set a variable the applet observes. |
 | `rpc.call` | `sid`, `id`, `name`, `args` | Call a function the applet exposed. Answered with `rpc.result`. |
 | `rpc.result` | `sid`, `id`, `value`, `error` | Answer a call the applet made. **Every call must be answered**, or the applet waits forever. |
@@ -70,12 +69,6 @@ A screen is a program in a terminal on the machine, identified by a control-plan
 | `screen.scroll` | `sid`, `dir` | `up` / `down` / `bottom` — the viewer paging through scrollback. |
 | `screen.resize` | `sid`, `cols`, `rows` | Resize. Viewers re-send their size continuously; the connector only acts on a change. |
 | `session.close` | `sid` | Tear the screen down. |
-| `exec` | `id`, `command`, `cwd`, `stdin`, `timeout` | Run one command on the machine. Answered with `exec.result`. |
-| `exec.cancel` | `id` | Stop an in-flight `exec`. |
-| `file.write` | `id`, `path`, `data` | Write base64 `data` to `path` on the machine, creating parent directories and replacing any existing file atomically. Answered with `file.write.result`. No shell involved — `os.WriteFile` under the hood, so this works identically on every platform the connector targets. |
-| `file.read` | `id`, `path` | Read `path`. Answered with `file.read.result`; a missing file is answered as success with empty `data`, not an error (matching `cat 2>/dev/null \|\| true`, which this exists to replace). |
-| `file.remove` | `id`, `path` | Delete `path`. Answered with `file.remove.result`; a file that is already gone is success (matching `rm -f`). |
-| `homedir` | `id` | Ask this machine's real home directory. Answered with `homedir.result`. |
 | `update` | — | Ask the machine to update its own binary. What that means is the product's. |
 
 ### Machine → control plane
@@ -88,23 +81,6 @@ A screen is a program in a terminal on the machine, identified by a control-plan
 | `rpc.call` | `sid`, `id`, `name`, `args` | The applet is calling the control plane. Must be answered with `rpc.result`. |
 | `rpc.result` | `sid`, `id`, `value`, `error` | The answer to a `rpc.call` from the control plane. |
 | `screen.data` | `sid`, `data` | Base64 terminal bytes for the attached viewer. |
-| `exec.result` | `id`, `stdout`, `stderr`, `exit`, `truncated` | The result of an `exec`. `truncated` means output hit the size cap. |
-| `file.write.result` | `id`, `error` | The result of a `file.write`. Empty `error` is success. |
-| `file.read.result` | `id`, `data`, `error` | The result of a `file.read`. |
-| `file.remove.result` | `id`, `error` | The result of a `file.remove`. |
-| `homedir.result` | `id`, `path`, `error` | The result of a `homedir` — `path` carries the resolved directory (reused rather than a new field, since that's exactly what it is). |
-
-### `file.*` and `homedir`, and why they are not `exec`
-
-A control plane that needs to write a file to a machine — a CA cert, a credential, a settings file —
-could do it with `exec` and a shell script (`mkdir -p ... && base64 -d ... > ...`), and that is
-exactly how this used to work. The trouble is that "a shell script" quietly means "a Unix machine":
-it assumes `bash` (or something bash-compatible) is on the machine, which is never true on native
-Windows and cannot be assumed even on Unix. `file.write` / `file.read` / `file.remove` / `homedir`
-exist so a control plane never has to know or generate shell syntax for this at all — the connector
-does it with `os.WriteFile` / `os.ReadFile` / `os.Remove` / `os.UserHomeDir`, which behave the same
-on every platform this connector targets. Use `exec` for what is genuinely running a program;
-use these for moving a file or asking where home is.
 
 ### Adoption, and why it exists
 
