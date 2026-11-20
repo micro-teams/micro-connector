@@ -286,3 +286,12 @@ test('normal mode: the OAuth variables stay empty', () => {
   assert.equal(host.vars.oauthUrl, '')
   assert.equal(host.vars.loginState, '')
 })
+
+test('a message resent with the same id is typed once', () => {
+  const host = loadDriver()
+  host.frame(IDLE)
+  host.exposed.say('once', 'm9')
+  host.exposed.say('once', 'm9')
+  for (let i = 0; i < 8; i++) host.frame(IDLE)
+  assert.equal(host.keys().split('once').length - 1, 1)
+})

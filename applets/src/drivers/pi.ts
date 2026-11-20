@@ -30,12 +30,12 @@ defineDriver({
     // the verdict.
     const working = /[⠁-⣿]/.test(tailStr) && /\bWorking\b/.test(tailStr)
 
-    // The context line "1.4%/100k (auto)   mock-1" — session token usage over the window, and the
-    // active model — is painted for as long as the TUI is up, so it is the hasUI signal. The
-    // percentage is cumulative session usage, NOT a per-turn count: that is why progress() below
-    // reports nothing rather than mislabeling it.
+    // The context line "1.4%/100k (auto)   mock-1" (session token usage over the window, and the
+    // model) is painted while the prompt is up, so it is the UI signal; while pi says its startup
+    // is still in progress, input is not taken yet. The percentage is cumulative, which is why
+    // progress() reports nothing.
     const hasUI =
-      /\d+(\.\d+)?%\/\d+[kKmM]?\s*\(/.test(tailStr) || tail.filter((l) => l.trim()).length > 3
+      /\d+(\.\d+)?%\/\d+[kKmM]?\s*\(/.test(tailStr) && !/Startup is still in progress/i.test(tailStr)
     return { kind: 'open', working, hasUI }
   },
 

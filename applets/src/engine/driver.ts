@@ -10,7 +10,7 @@
 //                             status (starting|busy|waiting|idle|dead), elapsed, tokens, question,
 //                             choices and spec.vars. `say` queues the text; once it is pasted and
 //                             submitted the engine calls the control plane's `sayResult({id, ok,
-//                             error})` when an id was given.
+//                             error})` when an id was given; a repeated id is ignored.
 //   send(text, mode)          queues input from a command, typed ('type') or pasted ('paste').
 //   tail(screen, n)           the last n painted lines.
 //   options helpers           chooseByLabel, chooseNearCursorByLabel, readOptions, parseOption,
@@ -264,7 +264,14 @@ export function defineDriver(spec: DriverSpec): void {
 
   // --- what the control plane may call --------------------------------------
   host.expose('snapshot', () => term.read())
+  // A message with an id is taken once: the control plane may resend one it never heard back about,
+  // and typing it twice would deliver it twice.
+  const seen = new Set<string>()
   host.expose('say', (text: unknown, id?: unknown) => {
+    if (id !== undefined) {
+      if (seen.has(String(id))) return 'queued'
+      seen.add(String(id))
+    }
     const body = spec.beforeSay ? spec.beforeSay(String(text)) : String(text)
     inputQueue.push({ text: body, mode: 'paste', id: id === undefined ? undefined : String(id) })
     return 'queued'

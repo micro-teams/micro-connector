@@ -79,3 +79,13 @@ test('an empty screen is starting, not idle', () => {
   host.frame('')
   assert.equal(host.vars['status'], 'starting')
 })
+
+test('nothing is typed while pi says its startup is still in progress', () => {
+  const host = loadDriver()
+  const starting = 'Startup is still in progress\n\n0.0%/100k (auto)   mock-1'
+  host.exposed.say('too early', 'm1')
+  for (let i = 0; i < 4; i++) host.frame(starting)
+  assert.equal(host.keys(), '')
+  for (let i = 0; i < 4; i++) host.frame('\n\n0.0%/100k (auto)   mock-1')
+  assert.ok(host.keys().includes('too early'))
+})
