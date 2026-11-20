@@ -9,7 +9,7 @@
 //	POST /machine/enroll/start   -> {"code", "approveUrl", "interval"}
 //	POST /machine/enroll/poll    -> {"status": "approved", "machineId", "token"}
 //	GET  /link                   WebSocket; the machine authenticates with the
-//	                             X-Microteams-Session header carrying its token
+//	                             X-Testconn-Session header carrying its token
 //	POST /test/open              {"machine", "sid", "applet", "command", "env"} -> session.create
 //	POST /test/call              {"machine", "sid", "name", "args"} -> {"id"}; sends rpc.call
 //	GET  /test/state             {"screens": {sid: {"ready", "driver", "error", "vars"}},
@@ -123,7 +123,7 @@ func (s *server) enrollPoll(w http.ResponseWriter, _ *http.Request) {
 
 func (s *server) link(w http.ResponseWriter, r *http.Request) {
 	s.mu.Lock()
-	id, ok := s.tokens[r.Header.Get("X-Microteams-Session")]
+	id, ok := s.tokens[r.Header.Get("X-Testconn-Session")]
 	s.mu.Unlock()
 	if !ok {
 		http.Error(w, "unknown machine token", http.StatusUnauthorized)

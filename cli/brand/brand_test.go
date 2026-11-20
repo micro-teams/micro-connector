@@ -1,3 +1,4 @@
+// Tests for the brand's environment names and runtime paths.
 package brand
 
 import (
@@ -8,11 +9,7 @@ import (
 	"testing"
 )
 
-// setHome overrides the current user's home directory for the duration of the test, on whichever
-// platform's own convention os.UserHomeDir actually reads: $HOME everywhere except Windows, where
-// it is %USERPROFILE% instead. Setting only HOME leaves a Windows test reading the real runner's
-// profile dir, not the fake one — that mismatch, not a RuntimePath bug, is what a naive HOME-only
-// t.Setenv would fail on there.
+// setHome sets the home directory os.UserHomeDir reads: $HOME, and %USERPROFILE% on Windows.
 func setHome(t *testing.T, dir string) {
 	t.Helper()
 	t.Setenv("HOME", dir)
@@ -21,11 +18,7 @@ func setHome(t *testing.T, dir string) {
 	}
 }
 
-// The socket lived in /tmp until a reboot proved twice why it must not.
-//
-// /tmp is world-writable, so "<brand>-<uid>" is a name anything can take first, and it is a tmpfs,
-// so it is empty at boot and the race is run again every time the machine starts. The loser of that
-// race cannot open its own socket, and what a person sees is an agent that will not open.
+// /tmp is world-writable and emptied at boot, so the runtime path is under the home directory.
 func TestRuntimePathIsUnderHomeNotTmp(t *testing.T) {
 	home := t.TempDir()
 	setHome(t, home)
@@ -37,10 +30,7 @@ func TestRuntimePathIsUnderHomeNotTmp(t *testing.T) {
 	}
 }
 
-// The service and a person's shell must meet at one socket. The service, a systemd system unit,
-// has no $XDG_RUNTIME_DIR; a login shell has /run/user/<uid>. When the path followed that variable,
-// `status` in a shell looked in /run/user/<uid>, reported no screens while the service hosted
-// several under $HOME, and left a stray directory behind.
+// A system service has no $XDG_RUNTIME_DIR and a login shell has one; both must meet at one socket.
 func TestRuntimePathIsTheSameWithOrWithoutXDGRuntimeDir(t *testing.T) {
 	setHome(t, t.TempDir())
 	t.Setenv("XDG_RUNTIME_DIR", "")
@@ -52,8 +42,7 @@ func TestRuntimePathIsTheSameWithOrWithoutXDGRuntimeDir(t *testing.T) {
 	}
 }
 
-// A runtime dir set but pointing nowhere is the case a system service hits at boot: logind has not
-// made /run/user/<uid> yet because nobody has logged in. The path does not depend on it at all.
+// A runtime dir that does not exist yet (nobody has logged in) does not matter either.
 func TestRuntimePathFallsBackToHomeNotTmp(t *testing.T) {
 	t.Setenv("XDG_RUNTIME_DIR", filepath.Join(t.TempDir(), "not-there"))
 	home := t.TempDir()
@@ -65,7 +54,7 @@ func TestRuntimePathFallsBackToHomeNotTmp(t *testing.T) {
 	}
 }
 
-// And with neither, it still returns something rather than failing to start.
+// Without a home directory the path is under the temp dir.
 func TestRuntimePathStillAnswersWithNothingSet(t *testing.T) {
 	t.Setenv("XDG_RUNTIME_DIR", "")
 	setHome(t, "")
@@ -74,8 +63,7 @@ func TestRuntimePathStillAnswersWithNothingSet(t *testing.T) {
 	}
 }
 
-// Where a build that followed $XDG_RUNTIME_DIR put the socket, so an update can find it; nothing
-// for a process without one.
+// XDGRuntimePath is under $XDG_RUNTIME_DIR, and empty without it.
 func TestXDGRuntimePathIsWhereTheRuntimeDirPointed(t *testing.T) {
 	run := t.TempDir()
 	t.Setenv("XDG_RUNTIME_DIR", run)
@@ -88,8 +76,7 @@ func TestXDGRuntimePathIsWhereTheRuntimeDirPointed(t *testing.T) {
 	}
 }
 
-// An in-place update must not strand the sessions the previous build is hosting: the socket it
-// started lives under the temp dir, and this is the path that still points at it.
+// LegacyRuntimePath is under the temp dir.
 func TestLegacyRuntimePathIsTheOldTmpOne(t *testing.T) {
 	t.Setenv("XDG_RUNTIME_DIR", t.TempDir())
 

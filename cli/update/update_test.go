@@ -1,3 +1,4 @@
+// Tests for the published binary's platform directory and URL.
 package update
 
 import (
@@ -60,7 +61,7 @@ func TestBinaryURL(t *testing.T) {
 		},
 	}
 	for _, c := range cases {
-		got, err := binaryURL(c.base, c.dir)
+		got, err := binaryURL(c.base, c.dir, brand.Current.Name)
 		if err != nil {
 			t.Fatalf("binaryURL(%q,%q) error: %v", c.base, c.dir, err)
 		}
@@ -78,7 +79,7 @@ func init() {
 }
 
 func TestBinaryURLBadBase(t *testing.T) {
-	if _, err := binaryURL("not-a-url", "linux-x86_64"); err == nil {
+	if _, err := binaryURL("not-a-url", "linux-x86_64", "x"); err == nil {
 		t.Error("expected error for base without host")
 	}
 }
