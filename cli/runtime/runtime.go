@@ -1,85 +1,77 @@
-// Package runtime is a generic terminal-driving engine: it hosts a piece of
-// server-supplied JavaScript against a live terminal and a two-way channel to a
-// server. It knows nothing about what runs in the terminal or why — no domain
-// concepts appear here. The hosted script is the only thing that ascribes
-// meaning; this package just gives it exactly three affordances:
+// Package runtime hosts one screen's applet: a piece of JavaScript from the control plane that drives
+// a terminal. It gives the applet exactly three things and ascribes no meaning to any of them:
 //
-//   - a terminal it can read and write,
-//   - variables (some it owns and the server mirrors; some the server owns and
-//     it mirrors),
-//   - functions (some it exposes for the server to call; some the server
-//     exposes for it to call).
+//   - the terminal: read the screen, write input, hold the input lease, hear about changes;
+//   - variables: some the applet owns and the control plane mirrors (own), some the control plane
+//     owns and the applet observes (watch);
+//   - functions: some the applet exposes for the control plane to call (expose), some the control
+//     plane answers for the applet (call).
 //
-// Everything runs on a single goroutine (a small event loop) so the script sees
-// a consistent, race-free world: terminal-change notifications, inbound server
-// messages, and resolved calls are all delivered as jobs on that loop.
+// Everything the applet sees happens on one goroutine, a small event loop, so the script runs in a
+// consistent world: screen changes, messages from the control plane and resolved calls are all jobs
+// on that loop. The script reaches all of it through one global, `connector`, described in api.go.
+//
+//	New(term Terminal, bus Bus) *Runtime
+//	(*Runtime).Run(ctx) error         runs the loop until ctx ends; call it once, in its own goroutine.
+//	(*Runtime).Load(source string)    replaces the applet in a fresh VM, dropping the old one's state.
+//	(*Runtime).SetVar(name, value)    a control-plane variable changed (delivered to watch listeners).
+//	(*Runtime).Invoke(id, name, args) the control plane calls an exposed function; answered on the
+//	                                  bus with ReplyServer.
+//	(*Runtime).Resolve(id, result, err) the answer to the applet's call with that id.
+//
+// Example:
+//
+//	rt := runtime.New(term, bus)
+//	go rt.Run(ctx)
+//	rt.Load(driverSource)
+//	rt.Invoke("1", "say", []any{"hello"})
 package runtime
 
 import (
 	"context"
+	"errors"
 	"fmt"
 
 	"github.com/dop251/goja"
 )
 
-// Terminal is the read/write surface the script drives. Implementations back it
-// with a real pty/tmux; the runtime neither knows nor cares.
+// ErrHeld is what a Terminal returns when someone else holds the input lease.
+var ErrHeld = errors.New("runtime: the input lease is held by someone else")
+
+// Terminal is the screen the applet drives.
 type Terminal interface {
-	// Snapshot returns the current visible screen contents.
+	// Snapshot is the visible screen as text.
 	Snapshot() string
-	// Write sends bytes to the terminal (keystrokes, control sequences).
+	// Write types p into the program. ErrHeld when a person holds the input lease.
 	Write(p []byte) error
-	// OnChange registers fn to be called (from any goroutine) whenever the
-	// screen changes. The runtime marshals it back onto its own loop.
+	// Hold takes (true) or releases (false) the input lease for the applet, so a sequence of
+	// writes cannot be interleaved with a person's. ErrHeld when a person holds it.
+	Hold(on bool) error
+	// OnChange registers fn, called from any goroutine on every screen change and periodically.
 	OnChange(fn func())
 }
 
-// Bus is the two-way channel to the server. The runtime uses it to push the
-// values of script-owned variables, to invoke server functions, and to answer
-// server calls; the server uses SetInbound's handler to deliver the reverse.
-// It carries only names and JSON-able values — no domain shape.
+// Bus carries the applet's side of the variable and function channels to the control plane.
 type Bus interface {
-	// PushVar reports a new value for a script-owned variable to the server.
 	PushVar(name string, value any)
-	// CallServer invokes a server-exposed function; reply is delivered later
-	// (on the runtime loop) with the result or an error string.
 	CallServer(id, name string, args []any)
-	// ReplyServer answers a server->script call previously received.
 	ReplyServer(id string, result any, errStr string)
-	// SetInbound registers the sink for messages coming from the server.
-	SetInbound(Inbound)
 }
 
-// Inbound is how the Bus hands server-originated events to the runtime. All
-// methods may be called from any goroutine; the runtime re-marshals them onto
-// its loop.
-type Inbound interface {
-	// SetVar delivers a new value for a server-owned variable.
-	SetVar(name string, value any)
-	// Invoke asks the script to run one of its exposed functions.
-	Invoke(id, name string, args []any)
-	// Resolve delivers the result of a prior CallServer.
-	Resolve(id string, result any, errStr string)
-	// LoadScript replaces the hosted script (hot update).
-	LoadScript(source string)
-}
-
-// Runtime hosts one script against one terminal and one bus.
+// Runtime hosts one applet against one terminal and one bus.
 type Runtime struct {
 	term Terminal
 	bus  Bus
-
-	vm   *goja.Runtime
 	jobs chan func()
 
-	// owned: script-owned variables (script r/w, server mirrors). watched:
-	// server-owned variables (server r/w, script observes). Each maps a name to
-	// its cached value and the script callbacks watching it.
-	owned   map[string]any
-	watched map[string]*watchedVar
-	exposed map[string]goja.Callable
-	pending map[string]*pendingCall
-	callSeq int
+	// Loop-only state: touched only by jobs on the loop goroutine.
+	vm       *goja.Runtime
+	owned    map[string]any
+	watched  map[string]*watchedVar
+	exposed  map[string]goja.Callable
+	pending  map[string]*pendingCall
+	callSeq  int
+	onChange goja.Callable
 }
 
 type watchedVar struct {
@@ -92,41 +84,14 @@ type pendingCall struct {
 	reject  func(any) error
 }
 
-// New builds a Runtime over the given terminal and bus.
 func New(term Terminal, bus Bus) *Runtime {
-	r := &Runtime{
-		term:    term,
-		bus:     bus,
-		jobs:    make(chan func(), 256),
-		owned:   map[string]any{},
-		watched: map[string]*watchedVar{},
-		exposed: map[string]goja.Callable{},
-		pending: map[string]*pendingCall{},
-	}
-	bus.SetInbound(r)
-	term.OnChange(func() { r.enqueue(r.fireTerminalChange) })
+	r := &Runtime{term: term, bus: bus, jobs: make(chan func(), 256)}
+	r.reset()
+	term.OnChange(func() { r.jobs <- r.fireChange })
 	return r
 }
 
-// enqueue schedules fn to run on the loop. Safe from any goroutine.
-func (r *Runtime) enqueue(fn func()) {
-	select {
-	case r.jobs <- fn:
-	default:
-		// Loop is backed up; run synchronously would break the single-thread
-		// invariant, so block briefly — the loop drains fast.
-		r.jobs <- fn
-	}
-}
-
-// Run drives the event loop until ctx is cancelled. All script execution
-// happens here, on this one goroutine.
 func (r *Runtime) Run(ctx context.Context) error {
-	r.vm = goja.New()
-	r.vm.SetFieldNameMapper(goja.TagFieldNameMapper("json", true))
-	if err := r.installAPI(); err != nil {
-		return err
-	}
 	for {
 		select {
 		case <-ctx.Done():
@@ -137,104 +102,93 @@ func (r *Runtime) Run(ctx context.Context) error {
 	}
 }
 
-// --- inbound (server -> runtime); all just marshal onto the loop -----------
-
-func (r *Runtime) SetVar(name string, value any) {
-	r.enqueue(func() { r.applyWatched(name, value) })
+// reset gives the applet a fresh VM. A new VM rather than re-running a script in the old one,
+// because a second run of the same top-level declarations fails ("already declared").
+func (r *Runtime) reset() {
+	r.vm = goja.New()
+	r.vm.SetFieldNameMapper(goja.TagFieldNameMapper("json", true))
+	r.owned = map[string]any{}
+	r.watched = map[string]*watchedVar{}
+	r.exposed = map[string]goja.Callable{}
+	r.pending = map[string]*pendingCall{}
+	r.onChange = nil
+	r.installAPI()
 }
 
-func (r *Runtime) Invoke(id, name string, args []any) {
-	r.enqueue(func() { r.runExposed(id, name, args) })
-}
-
-func (r *Runtime) Resolve(id string, result any, errStr string) {
-	r.enqueue(func() { r.resolveCall(id, result, errStr) })
-}
-
-func (r *Runtime) LoadScript(source string) {
-	r.enqueue(func() {
-		// Hot-reload in a FRESH VM. Re-running a new script in the old vm re-declares
-		// its top-level `const`/`let` in the same global scope → "Identifier X has
-		// already been declared" → the reload aborts and leaves the driver corrupted.
-		// A new vm (with the API re-installed and the per-script state cleared) lets a
-		// normal, well-formed driver be reloaded cleanly, and drops the previous
-		// script's watch listeners / exposed fns instead of leaking them. Runs on the
-		// loop goroutine, the only place vm is touched, so the swap is safe.
-		r.vm = goja.New()
-		r.vm.SetFieldNameMapper(goja.TagFieldNameMapper("json", true))
-		r.owned = map[string]any{}
-		r.watched = map[string]*watchedVar{}
-		r.exposed = map[string]goja.Callable{}
-		r.pending = map[string]*pendingCall{}
-		if err := r.installAPI(); err != nil {
-			r.logf("reload installAPI: %v", err)
-			return
-		}
+func (r *Runtime) Load(source string) {
+	r.jobs <- func() {
+		r.reset()
 		if _, err := r.vm.RunString(source); err != nil {
-			r.logf("script error: %v", err)
-		}
-	})
-}
-
-// --- loop-side handlers -----------------------------------------------------
-
-var terminalChangeFn = "__onTerminalChange"
-
-func (r *Runtime) fireTerminalChange() {
-	if fn, ok := goja.AssertFunction(r.vm.Get(terminalChangeFn)); ok {
-		if _, err := fn(goja.Undefined()); err != nil {
-			r.logf("onChange handler: %v", err)
+			r.logf("applet failed to load: %v", err)
 		}
 	}
 }
 
-func (r *Runtime) applyWatched(name string, value any) {
+func (r *Runtime) SetVar(name string, value any) {
+	r.jobs <- func() {
+		w := r.watch(name)
+		w.value = value
+		for _, cb := range w.listeners {
+			if _, err := cb(goja.Undefined(), r.vm.ToValue(value)); err != nil {
+				r.logf("watch(%s) listener: %v", name, err)
+			}
+		}
+	}
+}
+
+func (r *Runtime) Invoke(id, name string, args []any) {
+	r.jobs <- func() {
+		fn := r.exposed[name]
+		if fn == nil {
+			r.bus.ReplyServer(id, nil, fmt.Sprintf("the applet exposes no function %q", name))
+			return
+		}
+		vals := make([]goja.Value, len(args))
+		for i, a := range args {
+			vals[i] = r.vm.ToValue(a)
+		}
+		res, err := fn(goja.Undefined(), vals...)
+		if err != nil {
+			r.bus.ReplyServer(id, nil, err.Error())
+			return
+		}
+		r.bus.ReplyServer(id, res.Export(), "")
+	}
+}
+
+func (r *Runtime) Resolve(id string, result any, errStr string) {
+	r.jobs <- func() {
+		p := r.pending[id]
+		if p == nil {
+			return
+		}
+		delete(r.pending, id)
+		var err error
+		if errStr != "" {
+			err = p.reject(r.vm.ToValue(errStr))
+		} else {
+			err = p.resolve(r.vm.ToValue(result))
+		}
+		if err != nil {
+			r.logf("resolve call %s: %v", id, err)
+		}
+	}
+}
+
+func (r *Runtime) fireChange() {
+	if r.onChange == nil {
+		return
+	}
+	if _, err := r.onChange(goja.Undefined()); err != nil {
+		r.logf("onChange handler: %v", err)
+	}
+}
+
+func (r *Runtime) watch(name string) *watchedVar {
 	w := r.watched[name]
 	if w == nil {
 		w = &watchedVar{}
 		r.watched[name] = w
 	}
-	w.value = value
-	for _, cb := range w.listeners {
-		if _, err := cb(goja.Undefined(), r.vm.ToValue(value)); err != nil {
-			r.logf("watch(%s) listener: %v", name, err)
-		}
-	}
-}
-
-func (r *Runtime) runExposed(id, name string, args []any) {
-	fn := r.exposed[name]
-	if fn == nil {
-		r.bus.ReplyServer(id, nil, fmt.Sprintf("no exposed function %q", name))
-		return
-	}
-	vals := make([]goja.Value, len(args))
-	for i, a := range args {
-		vals[i] = r.vm.ToValue(a)
-	}
-	res, err := fn(goja.Undefined(), vals...)
-	if err != nil {
-		r.bus.ReplyServer(id, nil, err.Error())
-		return
-	}
-	r.bus.ReplyServer(id, res.Export(), "")
-}
-
-func (r *Runtime) resolveCall(id string, result any, errStr string) {
-	p := r.pending[id]
-	if p == nil {
-		return
-	}
-	delete(r.pending, id)
-	if errStr != "" {
-		_ = p.reject(r.vm.ToValue(errStr))
-		return
-	}
-	_ = p.resolve(r.vm.ToValue(result))
-}
-
-func (r *Runtime) logf(format string, a ...any) {
-	if fn, ok := goja.AssertFunction(r.vm.Get("__log")); ok {
-		_, _ = fn(goja.Undefined(), r.vm.ToValue(fmt.Sprintf(format, a...)))
-	}
+	return w
 }

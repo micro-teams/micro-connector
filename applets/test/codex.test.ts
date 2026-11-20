@@ -30,13 +30,18 @@ test('the operator instructions are prepended once, to the first message only', 
   const host = loadDriver()
   host.frame('\n› \n')
   host.clearKeys()
+  const IDLE = '\n› \n'
   host.exposed.say('first')
+  host.exposed.say('second')
+  host.frame(IDLE)
   const first = host.keys()
   host.clearKeys()
-  host.exposed.say('second')
+  host.frame(IDLE)
+  host.frame(IDLE)
+  host.frame(IDLE)
   const second = host.keys()
   // The placeholder is un-substituted in a test build, which is itself the guard: an un-replaced
   // placeholder must never be pasted into a terminal.
   assert.ok(!first.includes('__MT_'), 'an un-substituted placeholder must not be sent')
-  assert.ok(first.includes('first') && second.includes('second'))
+  assert.ok(first.includes('first') && second.includes('second') && !second.includes('first'))
 })

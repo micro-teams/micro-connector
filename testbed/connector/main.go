@@ -64,8 +64,9 @@ func main() {
 	mgr := screen.NewManager(ctx, conn, tm)
 	mgr.OnScreensChanged = func(live int) { fmt.Println("screens:", live) }
 
-	defer mgr.CloseAll()
+	// This connector's tmux server is the test run's own (under its HOME), so it goes with it.
 	defer tm.KillServer()
+	defer mgr.Detach()
 	fmt.Println("connected; waiting for the control plane")
 	_ = conn.Run(ctx, mgr.Dispatch)
 }

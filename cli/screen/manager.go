@@ -1,23 +1,38 @@
-// Package screen runs terminal screens on this machine on behalf of a control plane.
+// Package screen runs terminal screens on this machine for a control plane.
 //
-// A screen is a program in a terminal, driven two ways at once: through a hosted script (the
-// applet) over a variable/function bus, and directly, as a raw byte stream to and from the terminal
-// for a human watching it. This package wires those together and ascribes no meaning to any of it —
-// what a screen is FOR belongs to the control plane and its applets.
+// A screen is a program in a tmux session, driven two ways at once: by its applet (see runtime),
+// and by people watching it, each through their own tmux client (see viewers.go). This package
+// routes the protocol's messages to both and ascribes no meaning to any of it; what a screen is
+// for belongs to the control plane and its applet.
 //
-// It is deliberately unaware of how it is reached. Messages arrive from a protocol.Transport, which
-// may be a resident WebSocket that lives as long as the machine or an HTTP exchange that lives as
-// long as one command, and the code below cannot tell the difference.
+// Messages are handled off the transport's read loop: everything for one screen runs in order on
+// that screen's own queue, so a slow tmux call delays only its own screen, never the link or the
+// other screens.
+//
+// Screens outlive this process. Detach, what a connector does when it stops or replaces itself,
+// leaves every tmux session running; the next process re-adopts them when the control plane sends
+// session.create with adopt. Only session.close ends a program.
+//
+//	NewManager(ctx, conn protocol.Transport, tm *terminal.Manager) *Manager
+//	(*Manager).Dispatch(msg protocol.Msg)  handles one inbound message; pass it to conn.Run.
+//	(*Manager).Detach()                    stops driving and watching every screen, keeping them.
+//	(*Manager).OnScreensChanged func(live int)  told how many sessions tmux has, after each change.
+//	(*Manager).OnUpdateRequested func()         called when the control plane sends `update`.
+//
+// Example:
+//
+//	mgr := screen.NewManager(ctx, conn, tm)
+//	defer mgr.Detach()
+//	conn.Run(ctx, mgr.Dispatch)
 package screen
 
 import (
 	"context"
-	"encoding/base64"
 	"fmt"
 	"os"
 	"path/filepath"
-	"strings"
 	"sync"
+	"time"
 
 	"github.com/micro-teams/micro-connector/cli/brand"
 	"github.com/micro-teams/micro-connector/cli/protocol"
@@ -25,448 +40,312 @@ import (
 	"github.com/micro-teams/micro-connector/cli/terminal"
 )
 
-// scrollStep is how many scrollback lines one viewer scroll message moves. The
-// browser coalesces wheel/touch into discrete up/down messages, so a small step
-// gives a smooth, wheel-like feel while paging through tmux copy-mode history.
-const scrollStep = 3
-
-// Manager owns the live screens on this machine and the transport they are driven over.
 type Manager struct {
 	conn protocol.Transport
 	tm   *terminal.Manager
+	ctx  context.Context
 
-	ctx      context.Context
-	mu       sync.Mutex
-	sessions map[string]*sess
+	mu      sync.Mutex
+	screens map[string]*screen
+	queues  map[string]*queue
 
-	// The two things a product, rather than a screen manager, decides.
-	//
-	// OnScreensChanged reports how many screens tmux actually has, whenever that changes; a product
-	// may publish it where its own CLI can read it. Counting what tmux has rather than what the map
-	// remembers is the point: a map entry outlives its session, and after a tmux server died the
-	// old count went on claiming live screens nobody could open.
-	//
-	// OnUpdateRequested fires when the control plane asks this machine to update itself. What
-	// updating means — where the binary comes from, whether running screens survive it — belongs to
-	// the product.
 	OnScreensChanged  func(live int)
 	OnUpdateRequested func()
 }
 
-// NewManager builds a screen manager on a transport and a tmux manager. Nothing starts until the
-// control plane says so: the manager only ever reacts to messages handed to Dispatch.
 func NewManager(ctx context.Context, conn protocol.Transport, tm *terminal.Manager) *Manager {
-	return &Manager{
-		ctx:      ctx,
-		conn:     conn,
-		tm:       tm,
-		sessions: map[string]*sess{},
+	return &Manager{ctx: ctx, conn: conn, tm: tm, screens: map[string]*screen{}, queues: map[string]*queue{}}
+}
+
+// screen is one hosted program and everything attached to it.
+type screen struct {
+	sid    string
+	term   *terminal.Session
+	rt     *runtime.Runtime
+	cancel context.CancelFunc
+	source string // the applet now loaded
+
+	mu      sync.Mutex
+	viewers map[string]*viewer
+	cols    int
+	rows    int
+	lease   lease
+	inMode  bool // a viewer has sent mouse input since the pane last left copy-mode
+}
+
+func (m *Manager) send(msg protocol.Msg) {
+	if err := m.conn.Send(msg); err != nil {
+		fmt.Fprintf(os.Stderr, "%s: send %s for %s: %v\n", brand.Current.Name, msg.T, msg.Sid, err)
 	}
 }
 
-// publishState reports the number of screens tmux really has to whoever asked to know.
-func (m *Manager) publishState() {
-	if m.OnScreensChanged == nil {
-		return
-	}
+func (m *Manager) screen(sid string) *screen {
 	m.mu.Lock()
-	sids := make([]string, 0, len(m.sessions))
-	for sid := range m.sessions {
-		sids = append(sids, sid)
-	}
-	m.mu.Unlock()
-	n := 0
-	for _, sid := range sids {
-		if m.tm.HasSession(sid) {
-			n++
-		}
-	}
-	m.OnScreensChanged(n)
-}
-
-// CloseAll tears every screen down. The tmux sessions themselves are left alone: whether a screen's
-// program should outlive this process is decided where the process ends, not here.
-func (m *Manager) CloseAll() { m.closeAll() }
-
-// CloseViewerClients detaches every attached viewer without touching the programs — what a process
-// about to replace itself must do, so no orphan tmux client is left fighting the next one.
-func (m *Manager) CloseViewerClients() { m.closeViewerClients() }
-
-type sess struct {
-	term     *terminal.Session
-	rt       *runtime.Runtime
-	cancel   context.CancelFunc
-	client   *terminal.Client // a real tmux client (pty) while a viewer is attached
-	lastCols int
-	lastRows int
+	defer m.mu.Unlock()
+	return m.screens[sid]
 }
 
 func (m *Manager) Dispatch(msg protocol.Msg) {
 	switch msg.T {
 	case "welcome":
-		if msg.V != 0 && msg.V != protocol.Version {
-			fmt.Fprintf(os.Stderr, "%s: protocol version mismatch (control plane %d, this build %d) — update %s if things misbehave\n",
-				brand.Current.Name, msg.V, protocol.Version, brand.Current.Name)
+		if msg.V != protocol.Version {
+			fmt.Fprintf(os.Stderr, "%s: the control plane speaks protocol %d, this build %d\n",
+				brand.Current.Name, msg.V, protocol.Version)
 		}
-	case "session.create":
-		m.createSession(msg)
-	case "session.close":
-		m.closeSession(msg.Sid)
-	case "var.set": // server-owned variable pushed down
-		if s := m.session(msg.Sid); s != nil {
-			s.rt.SetVar(msg.Name, msg.Value)
-		}
-	case "rpc.call": // server invokes a script-exposed function
-		if s := m.session(msg.Sid); s != nil {
-			s.rt.Invoke(msg.ID, msg.Name, msg.Args)
-		}
-	case "rpc.result": // result of a script->server call
-		if s := m.session(msg.Sid); s != nil {
-			s.rt.Resolve(msg.ID, msg.Value, msg.Error)
-		}
-	case "screen.subscribe": // attach a real tmux client sized to the viewer
-		m.subscribeScreen(msg.Sid, msg.Cols, msg.Rows)
-	case "screen.unsubscribe":
-		m.unsubscribeScreen(msg.Sid)
-	case "screen.input": // raw viewer keystrokes -> the client's pty
-		if s := m.session(msg.Sid); s != nil && s.client != nil {
-			if b, err := base64.StdEncoding.DecodeString(msg.Data); err == nil {
-				// Typing means "back to the live program": leave any copy-mode
-				// scroll first, so the keystroke reaches the program instead of
-				// being interpreted as a copy-mode command.
-				s.term.ExitCopyMode()
-				_ = s.client.Write(b)
-			}
-		}
-	case "screen.scroll": // viewer pages through the pane's tmux scrollback (copy-mode)
-		if s := m.session(msg.Sid); s != nil {
-			switch msg.Dir {
-			case "up":
-				s.term.ScrollUp(scrollStep)
-			case "down":
-				s.term.ScrollDown(scrollStep)
-			default: // "bottom" / anything else: return to the live screen
-				s.term.ExitCopyMode()
-			}
-		}
-	case "update": // the control plane asks this machine to update itself
+		return
+	case "update":
 		if m.OnUpdateRequested != nil {
 			go m.OnUpdateRequested()
 		}
-	case "screen.resize":
-		if s := m.session(msg.Sid); s != nil {
-			// Viewers re-send their size continuously (and on a timer) to keep the
-			// real terminal matched to what they render. Resize only on an actual
-			// change, so same-size pings don't make the program repaint.
-			m.mu.Lock()
-			changed := msg.Cols != s.lastCols || msg.Rows != s.lastRows
-			s.lastCols, s.lastRows = msg.Cols, msg.Rows
-			client := s.client
-			m.mu.Unlock()
-			if changed && client != nil {
-				_ = client.Resize(msg.Cols, msg.Rows)
-			}
+		return
+	}
+	if msg.Sid == "" {
+		fmt.Fprintf(os.Stderr, "%s: %s without a screen id ignored\n", brand.Current.Name, msg.T)
+		return
+	}
+	m.queue(msg.Sid).do(func() { m.handle(msg) })
+}
+
+func (m *Manager) handle(msg protocol.Msg) {
+	if msg.T == "session.create" {
+		m.create(msg)
+		return
+	}
+	s := m.screen(msg.Sid)
+	if s == nil {
+		if msg.T == "screen.subscribe" {
+			m.viewerError(msg.Sid, msg.Viewer, "this machine is not hosting that screen")
 		}
+		return
+	}
+	switch msg.T {
+	case "session.close":
+		m.remove(s)
+		if err := s.term.Close(); err != nil {
+			fmt.Fprintf(os.Stderr, "%s: close %s: %v\n", brand.Current.Name, s.sid, err)
+		}
+		m.publishState()
+	case "var.set":
+		s.rt.SetVar(msg.Name, msg.Value)
+	case "rpc.call":
+		s.rt.Invoke(msg.ID, msg.Name, msg.Args)
+	case "rpc.result":
+		s.rt.Resolve(msg.ID, msg.Value, msg.Error)
+	case "screen.subscribe":
+		m.subscribe(s, msg.Viewer, msg.Cols, msg.Rows)
+	case "screen.resize":
+		m.resize(s, msg.Viewer, msg.Cols, msg.Rows)
+	case "screen.unsubscribe":
+		m.unsubscribe(s, msg.Viewer)
+	case "screen.input":
+		m.input(s, msg.Viewer, msg.Data)
+	case "screen.ack":
+		m.ack(s, msg.Viewer, msg.N)
+	case "screen.lease":
+		m.leaseOp(s, msg.Viewer, msg.Op)
+	case "screen.capture":
+		m.capture(s, msg.Viewer, msg.ID)
 	}
 }
 
-func (m *Manager) session(sid string) *sess {
-	m.mu.Lock()
-	defer m.mu.Unlock()
-	return m.sessions[sid]
-}
-
-func (m *Manager) createSession(msg protocol.Msg) {
-	if existing := m.session(msg.Sid); existing != nil {
-		// "We have an entry for it" is not the same as "it is still there". The tmux server can
-		// die under us — and when it does, nothing here notices: the applet runtime lives in THIS
-		// process, and reading a dead session's screen just returns "" (see terminal.Read), so the
-		// runtime keeps polling happily forever. Taking the shortcut below on that stale entry is
-		// what made a dead screen look healthy: the adopt hot-reloaded the applet, the applet
-		// announced itself with screenReady, and the server marked the screen LIVE again — while
-		// `tmux ls` reported no server at all and every viewer opened onto nothing.
-		//
-		// So check the ground truth first. A stale entry is torn down and we fall through, which
-		// either respawns the session (a create carrying a command) or reports session.error (a
-		// pure adopt, whose empty command cannot spawn) — and either outcome tells the server the
-		// truth instead of confirming a ghost.
-		if m.tm.HasSession(msg.Sid) {
-			// Same-process reconnect: the screen is genuinely live locally. An adopt create
-			// carries the current driver source — hot-reload it into the live runtime (this is how
-			// a backend restart pushes the latest applet into already-running screens). A non-adopt
-			// duplicate is a harmless no-op.
-			if msg.Adopt && msg.Source != "" {
-				existing.rt.LoadScript(msg.Source)
+// create starts a screen, or re-adopts one that is already running.
+func (m *Manager) create(msg protocol.Msg) {
+	alive, err := m.hasSession(msg.Sid)
+	if err != nil {
+		m.send(protocol.Msg{T: "session.error", Sid: msg.Sid, Error: err.Error()})
+		return
+	}
+	if s := m.screen(msg.Sid); s != nil {
+		if alive {
+			// The applet is reloaded only when it changed: a reload starts it from nothing and
+			// would drop the messages it is waiting to type.
+			if msg.Source != "" && msg.Source != s.source {
+				s.source = msg.Source
+				s.rt.Load(msg.Source)
 			}
+			m.send(protocol.Msg{T: "session.ready", Sid: msg.Sid})
 			return
 		}
-		m.closeSession(msg.Sid)
+		m.remove(s)
 	}
-	// The server owns the screen's identity: it hands down an opaque token in
-	// msg.Screen, which the host injects as MICROTEAMS_SCREEN so any process the screen
-	// spawns can prove which screen it belongs to when it calls back.
-	env := make([]string, 0, len(msg.Env)+2)
+	var term *terminal.Session
+	switch {
+	case alive:
+		term = m.tm.Adopt(msg.Sid)
+	case msg.Adopt && len(msg.Command) == 0:
+		m.send(protocol.Msg{T: "session.error", Sid: msg.Sid, Error: "the screen's program is no longer running on this machine"})
+		return
+	default:
+		env, err := m.environment(msg)
+		if err != nil {
+			m.send(protocol.Msg{T: "session.error", Sid: msg.Sid, Error: err.Error()})
+			return
+		}
+		if term, err = m.tm.Spawn(msg.Sid, msg.Command, env, msg.Cols, msg.Rows); err != nil {
+			m.send(protocol.Msg{T: "session.error", Sid: msg.Sid, Error: err.Error()})
+			return
+		}
+	}
+	cols, rows := msg.Cols, msg.Rows
+	s := &screen{sid: msg.Sid, term: term, source: msg.Source, viewers: map[string]*viewer{}, cols: cols, rows: rows}
+	s.rt = runtime.New(&driverTerm{m: m, s: s}, &bus{m: m, sid: msg.Sid})
+	ctx, cancel := context.WithCancel(m.ctx)
+	s.cancel = cancel
+	m.mu.Lock()
+	m.screens[msg.Sid] = s
+	m.mu.Unlock()
+
+	term.OnGone(func() {
+		m.queue(s.sid).do(func() {
+			if m.screen(s.sid) != s {
+				return
+			}
+			m.remove(s)
+			m.send(protocol.Msg{T: "session.error", Sid: s.sid, Error: "the screen's tmux session ended"})
+			m.publishState()
+		})
+	})
+	go s.rt.Run(ctx)
+	if msg.Source != "" {
+		s.rt.Load(msg.Source)
+	}
+	m.send(protocol.Msg{T: "session.ready", Sid: msg.Sid})
+	m.publishState()
+}
+
+// hasSession asks tmux, retrying a few times: one failed call is a busy tmux, not an answer.
+func (m *Manager) hasSession(sid string) (bool, error) {
+	var err error
+	for i := 0; i < 3; i++ {
+		var ok bool
+		if ok, err = m.tm.HasSession(sid); err == nil {
+			return ok, nil
+		}
+		time.Sleep(200 * time.Millisecond)
+	}
+	return false, err
+}
+
+// environment is the program's environment: the screen's identity token, a private temp
+// directory, then the control plane's variables, which win.
+func (m *Manager) environment(msg protocol.Msg) ([]string, error) {
+	env := []string{}
 	if msg.Screen != "" {
 		env = append(env, brand.Current.Env("SCREEN")+"="+msg.Screen)
 	}
-	// A temp directory of this user's own, so what the hosted program scratches down is not in
-	// /tmp. Programs name their scratch space after the uid — Claude Code writes /tmp/claude-$UID —
-	// and /tmp is world-writable, so that name is a race: whoever creates it first owns it, and on
-	// a tmpfs /tmp the race is re-run at every boot. The morning this was written, root had won it,
-	// and the agent died about a minute after starting, every time.
-	//
-	// Set before msg.Env so a server that has an opinion about TMPDIR still wins.
-	if tmp, err := screenTmpDir(msg.Sid); err == nil {
-		env = append(env, "TMPDIR="+tmp)
+	// Programs name scratch space after the uid in /tmp (/tmp/claude-$UID), which whoever creates
+	// it first owns; a directory of this user's own avoids that race.
+	tmp := filepath.Join(brand.Current.RuntimePath(), "tmp", msg.Sid)
+	if err := os.MkdirAll(tmp, 0o700); err != nil {
+		return nil, fmt.Errorf("screen temp dir: %w", err)
 	}
+	env = append(env, "TMPDIR="+tmp)
 	for k, v := range msg.Env {
 		env = append(env, k+"="+v)
 	}
-
-	// If a tmux session for this sid already exists (it survived an in-place update
-	// re-exec or a server restart), ADOPT it: re-establish the runtime + driver +
-	// polling around the still-running program instead of spawning a new session.
-	// Otherwise spawn a fresh tmux session + program as usual. The server sets
-	// msg.Adopt on the re-provision path; HasSession is the ground truth we act on.
-	var term *terminal.Session
-	if m.tm.HasSession(msg.Sid) {
-		term = m.tm.Adopt(msg.Sid)
-	} else {
-		var err error
-		term, err = m.tm.Spawn(msg.Sid, msg.Command, env, msg.Cols, msg.Rows)
-		if err != nil {
-			_ = m.conn.Send(protocol.Msg{T: "session.error", Sid: msg.Sid, Error: err.Error()})
-			return
-		}
-	}
-	rt := runtime.New(term, &busAdapter{conn: m.conn, sid: msg.Sid})
-	ctx, cancel := context.WithCancel(m.ctx)
-
-	m.mu.Lock()
-	m.sessions[msg.Sid] = &sess{term: term, rt: rt, cancel: cancel}
-	m.mu.Unlock()
-
-	// If this session dies while we are driving it, say so. Until the server is told, it keeps the
-	// screen LIVE — so it never respawns it and never queues anything for it, and messages sent to
-	// the agent are typed into a terminal that is not there any more (they end up in the connector
-	// log as failed writes, which no user reads). `session.error` is the same report a failed adopt
-	// makes, so the server's existing path takes it from here: mark the screen dead, then rebuild it
-	// the next time someone writes to the agent or opens its live screen.
-	sid := msg.Sid
-	term.OnGone(func() {
-		fmt.Fprintf(os.Stderr, "%s: screen %s: its tmux session is gone; reporting it dead\n", brand.Current.Name, sid)
-		m.closeSession(sid)
-		_ = m.conn.Send(protocol.Msg{T: "session.error", Sid: sid, Error: "terminal: session is gone"})
-		m.publishState()
-	})
-
-	go func() { _ = rt.Run(ctx) }()
-
-	if msg.Source != "" {
-		rt.LoadScript(msg.Source)
-	}
-	_ = m.conn.Send(protocol.Msg{T: "session.ready", Sid: msg.Sid})
-	m.publishState()
+	return env, nil
 }
 
-func (m *Manager) subscribeScreen(sid string, cols, rows int) {
-	s := m.session(sid)
-	// Somebody is waiting on the other end of this, so not hosting it has to be SAID. The server
-	// believes a screen is live until told otherwise; staying quiet leaves it believing that while
-	// a person watches a terminal that never opens — the exact shape of the report this came from:
-	// "microteams and the CLI both say connected, but the screen cannot actually be opened".
-	//
-	// It happens whenever the sessions died without this process watching them go: a stop kills the
-	// tmux server (`link disconnect` does), and a reboot takes it with /tmp. Reconnecting brings the
-	// link back but not the sessions, and the server's records outlive them.
-	//
-	// `session.error` is the report a failed adopt already makes, so the server's existing path
-	// takes it from here: mark the screen dead, then rebuild it the next time somebody opens it.
-	if s == nil {
-		_ = m.conn.Send(protocol.Msg{T: "session.error", Sid: sid,
-			Error: "terminal: this machine is not hosting that screen"})
-		return
-	}
-	if s.client != nil {
-		// Somebody is already attached, so tmux will not do us the favor a fresh `attach-session`
-		// does automatically: it emits a full clear+repaint only for the client that causes the
-		// attach, and the transport doesn't let a second real tmux client share a pty here (the
-		// hub sends only ONE screen.subscribe per NEW viewer, but there is one already-open pty
-		// for the whole screen — see MachineHub.attachViewer on the backend). Without something
-		// here, a second (or later) viewer is added to the hub's fan-out list and then simply waits
-		// for the *next* incidental change to paint over an initially blank/wrong local buffer —
-		// which is the exact gap this fix closes; see also ViewerPump's file header on the backend.
-		//
-		// So synthesize what a real attach would have sent: capture the pane as it stands right
-		// now, with color intact, and wrap it the same way a genuine attach frames a repaint —
-		// clear+home first, cursor placed and made visible last.
-		m.sendSyntheticSnapshot(sid, s)
-		return
-	}
-	// Having a record of the screen is not the same as the screen being there. tmux can die while
-	// this process lives — a `tmux kill-server`, an OOM, anything that takes the server without
-	// taking us — and Attach would not notice: it forks a pty and starts `tmux attach-session` in
-	// it, which SUCCEEDS as a fork even though the tmux inside it exits immediately with "no such
-	// session". A viewer then gets a pty that dies quietly, and still nobody has said anything.
-	//
-	// So ask tmux, which is the only thing that knows, before handing anybody a terminal.
-	if !m.tm.HasSession(sid) {
-		m.closeSession(sid)
-		_ = m.conn.Send(protocol.Msg{T: "session.error", Sid: sid,
-			Error: "terminal: that screen's session is gone"})
-		m.publishState()
-		return
-	}
-	// A fresh viewer always starts on the live screen: clear any copy-mode a
-	// previous viewer left behind on the pane.
-	s.term.ExitCopyMode()
-	client, err := s.term.Attach(cols, rows, func(b []byte) {
-		_ = m.conn.Send(protocol.Msg{T: "screen.data", Sid: sid,
-			Data: base64.StdEncoding.EncodeToString(b)})
-	})
-	if err != nil {
-		_ = m.conn.Send(protocol.Msg{T: "session.error", Sid: sid, Error: err.Error()})
-		return
-	}
+// remove forgets a screen and stops driving and watching it; its tmux session is untouched.
+func (m *Manager) remove(s *screen) {
 	m.mu.Lock()
-	s.client = client
-	s.lastCols, s.lastRows = cols, rows
-	m.mu.Unlock()
-}
-
-// sendSyntheticSnapshot reconstructs what a real `tmux attach-session` would have painted for a
-// viewer who cannot get one, because this screen already has a client attached (see the call site
-// in subscribeScreen for why real tmux cannot just hand out a second one here).
-//
-// Sent as an ordinary screen.data message, this is indistinguishable on the wire from a real
-// attach's output — and the backend's fan-out is not addressed to one viewer, so EVERY existing
-// viewer of this screen receives it too. For a viewer who already has a correct picture that is a
-// harmless, rare redraw flash — nothing here is wrong for them, just repainted — which is a good
-// trade for a viewer who would otherwise stay on a blank or stale screen indefinitely. There is no
-// finer-grained addressing in the current wire protocol to avoid it.
-func (m *Manager) sendSyntheticSnapshot(sid string, s *sess) {
-	body, err := s.term.CaptureANSI()
-	if err != nil {
-		// Nothing to send is no worse than today's silent nothing — and unlike subscribeScreen's
-		// other failure paths, the screen IS live (a client is attached to it right now), so this
-		// is not something the server needs telling about.
-		return
-	}
-	col, row, err := s.term.CursorPosition()
-	if err != nil {
-		col, row = 0, 0
-	}
-	var b strings.Builder
-	b.WriteString("\x1b[H\x1b[J") // clear + home, matching what a real attach sends first
-	// capture-pane -p joins lines with a bare "\n"; a terminal only moves down on that unless
-	// line-feed mode is on (it is not, by default), so each join has to carry its own "\r" too, or
-	// every line after the first renders stacked at the same column instead of on its own row.
-	b.WriteString(strings.ReplaceAll(body, "\n", "\r\n"))
-	fmt.Fprintf(&b, "\x1b[%d;%dH", row+1, col+1) // tmux's cursor_x/y are 0-indexed; CUP is 1-indexed
-	b.WriteString("\x1b[?25h")                   // cursor visible, matching what a real attach ends with
-	_ = m.conn.Send(protocol.Msg{T: "screen.data", Sid: sid,
-		Data: base64.StdEncoding.EncodeToString([]byte(b.String()))})
-}
-
-func (m *Manager) unsubscribeScreen(sid string) {
-	m.mu.Lock()
-	s := m.sessions[sid]
-	var client *terminal.Client
-	if s != nil {
-		client, s.client = s.client, nil
-		s.lastCols, s.lastRows = 0, 0
+	if m.screens[s.sid] == s {
+		delete(m.screens, s.sid)
 	}
 	m.mu.Unlock()
-	if s != nil {
-		// The last viewer left — never strand the pane in copy-mode, or the next
-		// viewer (and the driver's live sampling) would open into a frozen scroll.
-		s.term.ExitCopyMode()
-	}
-	if client != nil {
-		client.Close()
-	}
-}
-
-func (m *Manager) closeSession(sid string) {
-	m.mu.Lock()
-	s := m.sessions[sid]
-	delete(m.sessions, sid)
-	m.mu.Unlock()
-	m.teardown(s)
-	m.publishState()
-}
-
-// closeViewerClients detaches every live viewer pty (s.client) WITHOUT touching the
-// tmux sessions/tasks — used before a self-update exec so no viewer client orphans.
-func (m *Manager) closeViewerClients() {
-	m.mu.Lock()
-	clients := make([]*terminal.Client, 0, len(m.sessions))
-	for _, s := range m.sessions {
-		if s.client != nil {
-			clients = append(clients, s.client)
-			s.client, s.lastCols, s.lastRows = nil, 0, 0
-		}
-	}
-	m.mu.Unlock()
-	for _, c := range clients {
-		c.Close()
+	s.cancel()
+	s.term.Stop()
+	s.mu.Lock()
+	viewers := s.viewers
+	s.viewers = map[string]*viewer{}
+	s.lease.stop()
+	s.mu.Unlock()
+	for _, v := range viewers {
+		v.client.Close()
 	}
 }
 
-func (m *Manager) closeAll() {
+func (m *Manager) Detach() {
 	m.mu.Lock()
-	all := m.sessions
-	m.sessions = map[string]*sess{}
+	all := make([]*screen, 0, len(m.screens))
+	for _, s := range m.screens {
+		all = append(all, s)
+	}
 	m.mu.Unlock()
 	for _, s := range all {
-		m.teardown(s)
+		m.remove(s)
 	}
 }
 
-func (m *Manager) teardown(s *sess) {
-	if s == nil {
+func (m *Manager) publishState() {
+	if m.OnScreensChanged == nil {
 		return
 	}
-	if s.client != nil {
-		s.client.Close()
+	n, err := m.tm.LiveSessions()
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "%s: count screens: %v\n", brand.Current.Name, err)
+		return
 	}
-	s.cancel()
-	_ = s.term.Close()
+	m.OnScreensChanged(n)
 }
 
-// execMaxOut caps each of stdout/stderr so a runaway command can't exhaust memory.
-const execMaxOut = 1 << 20 // 1 MiB per stream
-
-// busAdapter maps one screen's runtime.Bus onto sid-tagged protocol messages. The runtime knows
-// nothing about the control plane, and this knows nothing about how the messages travel.
-type busAdapter struct {
-	conn protocol.Transport
-	sid  string
+// bus carries one screen's applet channels as sid-tagged messages.
+type bus struct {
+	m   *Manager
+	sid string
 }
 
-func (b *busAdapter) PushVar(name string, value any) {
-	_ = b.conn.Send(protocol.Msg{T: "var.push", Sid: b.sid, Name: name, Value: value})
+func (b *bus) PushVar(name string, value any) {
+	b.m.send(protocol.Msg{T: "var.push", Sid: b.sid, Name: name, Value: value})
 }
 
-func (b *busAdapter) CallServer(id, name string, args []any) {
-	_ = b.conn.Send(protocol.Msg{T: "rpc.call", Sid: b.sid, ID: id, Name: name, Args: args})
+func (b *bus) CallServer(id, name string, args []any) {
+	b.m.send(protocol.Msg{T: "rpc.call", Sid: b.sid, ID: id, Name: name, Args: args})
 }
 
-func (b *busAdapter) ReplyServer(id string, result any, errStr string) {
-	_ = b.conn.Send(protocol.Msg{T: "rpc.result", Sid: b.sid, ID: id, Value: result, Error: errStr})
+func (b *bus) ReplyServer(id string, result any, errStr string) {
+	b.m.send(protocol.Msg{T: "rpc.result", Sid: b.sid, ID: id, Value: result, Error: errStr})
 }
 
-// SetInbound is unused: the host routes inbound messages to the runtime directly
-// (see onMsg), so the adapter needs no reference back.
-func (b *busAdapter) SetInbound(runtime.Inbound) {}
+// queue runs one screen's work in order, on a goroutine that exists only while there is work.
+type queue struct {
+	mu      sync.Mutex
+	jobs    []func()
+	running bool
+}
 
-// screenTmpDir is a scratch directory belonging to this user, made once per screen so one agent
-// cannot read what another left behind. It sits beside the runtime dir rather than in /tmp — see
-// brand.RuntimePath for why that matters.
-func screenTmpDir(sid string) (string, error) {
-	dir := filepath.Join(brand.Current.RuntimePath(), "tmp", sid)
-	if err := os.MkdirAll(dir, 0o700); err != nil {
-		return "", err
+func (m *Manager) queue(sid string) *queue {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	q := m.queues[sid]
+	if q == nil {
+		q = &queue{}
+		m.queues[sid] = q
 	}
-	return dir, nil
+	return q
+}
+
+func (q *queue) do(job func()) {
+	q.mu.Lock()
+	q.jobs = append(q.jobs, job)
+	if q.running {
+		q.mu.Unlock()
+		return
+	}
+	q.running = true
+	q.mu.Unlock()
+	go func() {
+		for {
+			q.mu.Lock()
+			if len(q.jobs) == 0 {
+				q.running = false
+				q.mu.Unlock()
+				return
+			}
+			job := q.jobs[0]
+			q.jobs = q.jobs[1:]
+			q.mu.Unlock()
+			job()
+		}
+	}()
 }

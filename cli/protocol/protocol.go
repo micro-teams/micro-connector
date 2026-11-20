@@ -1,57 +1,60 @@
-// Package protocol is the language a connector and a control plane speak: the message set, and the
-// version number that lets two ends of different ages recognise each other.
+// Package protocol is the message set a connector and a control plane exchange, and the version
+// that lets two ends of different ages recognise each other. docs/protocol.md describes every
+// message; this package is its Go form.
 //
-// It is separate from the transport that carries it (transport/ws), so the screen manager and its
-// tests depend only on the message set.
+//	Version   the wire version, announced in `hello` (up) and `welcome` (down). It changes only when
+//	          an older peer could not survive the message set.
+//	Msg       one message: T names its type and only that type's fields are set. Unknown types and
+//	          fields are ignored by both ends.
+//	Transport what carries messages: Run delivers inbound messages to onMsg until ctx ends; Send may
+//	          be called from any goroutine and fails while disconnected.
+//
+// Example:
+//
+//	conn.Send(protocol.Msg{T: "screen.data", Sid: "s1", Viewer: "v1", Data: base64Bytes})
 package protocol
 
 import "context"
 
-// Version is the wire-protocol version this build speaks. Both ends announce it
-// in the opening handshake (`hello` up, `welcome` down), so a mismatch is
-// detectable and future revisions can negotiate capabilities without breaking
-// older peers. Bump it only for a breaking change.
-const Version = 1
+const Version = 2
 
-// Msg is the union of every field any control message uses. Only the relevant
-// ones are set per message type; the rest are omitted.
 type Msg struct {
-	T       string            `json:"t"`
-	V       int               `json:"v,omitempty"` // protocol version (hello / welcome)
-	Sid     string            `json:"sid,omitempty"`
-	Name    string            `json:"name,omitempty"`
-	Value   any               `json:"value,omitempty"`
-	ID      string            `json:"id,omitempty"`
-	Args    []any             `json:"args,omitempty"`
-	Error   string            `json:"error,omitempty"`
+	T   string `json:"t"`
+	V   int    `json:"v,omitempty"`
+	Sid string `json:"sid,omitempty"`
+	ID  string `json:"id,omitempty"`
+
+	// Applet channels: var.set / var.push (Name, Value), rpc.call (ID, Name, Args), rpc.result
+	// (ID, Value, Error).
+	Name  string `json:"name,omitempty"`
+	Value any    `json:"value,omitempty"`
+	Args  []any  `json:"args,omitempty"`
+	Error string `json:"error,omitempty"`
+
+	// session.create. Adopt marks a create for a screen that may already exist on the machine: a
+	// live one is kept, a missing one is reported, never spawned from an empty Command.
 	Command []string          `json:"command,omitempty"`
 	Env     map[string]string `json:"env,omitempty"`
 	Screen  string            `json:"screen,omitempty"`
-	Cols    int               `json:"cols,omitempty"`
-	Rows    int               `json:"rows,omitempty"`
 	Source  string            `json:"source,omitempty"`
-	// Adopt marks a session.create that re-drives a screen whose tmux session
-	// already survives on the device (after a server restart or an in-place update
-	// re-exec): the host re-establishes the runtime + driver around the existing
-	// tmux instead of spawning a new session. Unknown to older peers (ignored).
-	Adopt bool `json:"adopt,omitempty"`
-	// Data carries base64-encoded bytes: raw terminal bytes for the direct screen channel
-	// (screen.data downstream, screen.input upstream), or a file's content for file.write /
-	// file.read.result.
-	Data string `json:"data,omitempty"`
-	// Dir is the direction of a screen.scroll request ("up" / "down" / "bottom"):
-	// the viewer paging through the pane's tmux scrollback (copy-mode). Unknown to
-	// older peers (ignored).
-	Dir string `json:"dir,omitempty"`
+	Adopt   bool              `json:"adopt,omitempty"`
+
+	// Viewers. Viewer names the viewer a screen.* message comes from or goes to; "" is a single
+	// shared viewer. Cols and Rows are a viewer's available size (subscribe, resize) or the
+	// window's size (session.create, screen.size). Data is base64: terminal bytes (screen.data,
+	// screen.input) or text (screen.capture.result). N is a count of bytes (screen.ack).
+	Viewer string `json:"viewer,omitempty"`
+	Cols   int    `json:"cols,omitempty"`
+	Rows   int    `json:"rows,omitempty"`
+	Data   string `json:"data,omitempty"`
+	N      int    `json:"n,omitempty"`
+
+	// The input lease. Op is take, renew or release (screen.lease). Holder is who holds it in
+	// screen.lease.state: "" when free, "driver" for the applet, otherwise a viewer id.
+	Op     string `json:"op,omitempty"`
+	Holder string `json:"holder,omitempty"`
 }
 
-// Transport carries the message set. Implementations differ in everything except this: a resident
-// WebSocket that reconnects for as long as the machine is up, or an HTTP exchange that lives only
-// as long as one command.
-//
-// Run pumps inbound messages to onMsg until ctx is cancelled. Send is safe to call concurrently and
-// may fail while the transport is between connections; a caller that must not lose the message is
-// responsible for saying so again.
 type Transport interface {
 	Run(ctx context.Context, onMsg func(Msg)) error
 	Send(m Msg) error

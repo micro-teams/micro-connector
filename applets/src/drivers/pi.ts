@@ -20,7 +20,6 @@ defineDriver({
     const tail = tailOf(screen, 16).split('\n')
     const tailStr = tail.join('\n')
 
-    if (/Pane is dead \(status/.test(tailStr)) return { kind: 'dead' }
 
     // A working turn paints a bar: "── ⠋ Working ─────…" — an animated braille spinner
     // (U+2801–U+28FF) glued to the word "Working". The bar is up for the WHOLE turn — the model

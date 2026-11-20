@@ -19,6 +19,8 @@ export interface FakeHost extends Host {
   keys(): string
   clearKeys(): void
   setWatched(name: string, value: unknown): void
+  /** '' free, 'driver', or 'person' (a viewer holds the input lease). */
+  holder: string
 }
 
 export function makeHost(): FakeHost {
@@ -28,12 +30,22 @@ export function makeHost(): FakeHost {
     screen: '',
     written: [],
     vars: {},
-    watched: { viewerLevel: 'passive', label: '' },
+    watched: {},
+    holder: '',
     exposed: {},
     calls: [],
     term: {
       read: () => h.screen,
-      write: (d: string) => h.written.push(d),
+      write: (d: string) => {
+        if (h.holder === 'person') return false
+        h.written.push(d)
+        return true
+      },
+      hold: (on: boolean) => {
+        if (h.holder === 'person') return false
+        h.holder = on ? 'driver' : ''
+        return true
+      },
       onChange: (fn: () => void) => listeners.push(fn),
     },
     own: (name: string, initial: unknown) => {

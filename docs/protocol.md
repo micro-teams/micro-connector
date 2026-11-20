@@ -21,7 +21,8 @@ machines are not upgraded in lockstep, ever.
 ## Version
 
 `v` carries the protocol version, announced by both ends when a connection opens (`hello` up,
-`welcome` down). It is currently **1**.
+`welcome` down). It is currently **2**: version 2 added viewers (the `viewer` field, `screen.size`,
+`screen.ack`), the input lease and `screen.capture`, and removed `screen.scroll`.
 
 It changes only when the message set changes in a way an older peer cannot survive — which is rarer
 than a release, and is why it is not the product's version number. Adding a message type or a field
@@ -59,16 +60,18 @@ A screen is a program in a terminal on the machine, identified by a control-plan
 
 | `t` | fields | meaning |
 |---|---|---|
-| `session.create` | `sid`, `command`, `env`, `cols`, `rows`, `source`, `screen`, `adopt` | Open a screen. If a session with this `sid` already exists on the machine, it is **adopted** rather than replaced — see below. `source` is the applet's JavaScript. `screen` is an opaque per-screen token the connector injects into the program's environment. |
+| `session.create` | `sid`, `command`, `env`, `cols`, `rows`, `source`, `screen`, `adopt` | Open a screen of `cols` x `rows`. A session with this `sid` that is still running is **adopted** instead — see below. `source` is the applet's JavaScript; an adopted screen reloads it only when it differs from the one running. `screen` is an opaque per-screen token the connector puts in the program's environment. With `adopt` and no `command`, a screen that is not running is reported with `session.error`, never started. |
 | `var.set` | `sid`, `name`, `value` | Set a variable the applet observes. |
 | `rpc.call` | `sid`, `id`, `name`, `args` | Call a function the applet exposed. Answered with `rpc.result`. |
 | `rpc.result` | `sid`, `id`, `value`, `error` | Answer a call the applet made. **Every call must be answered**, or the applet waits forever. |
-| `screen.subscribe` | `sid`, `cols`, `rows` | Attach a viewer: raw terminal bytes start flowing as `screen.data`. |
-| `screen.unsubscribe` | `sid` | Detach the viewer. The program is untouched. |
-| `screen.input` | `sid`, `data` | Base64 keystrokes from a viewer, straight to the terminal. |
-| `screen.scroll` | `sid`, `dir` | `up` / `down` / `bottom` — the viewer paging through scrollback. |
-| `screen.resize` | `sid`, `cols`, `rows` | Resize. Viewers re-send their size continuously; the connector only acts on a change. |
-| `session.close` | `sid` | Tear the screen down. |
+| `screen.subscribe` | `sid`, `viewer`, `cols`, `rows` | Attach a viewer whose view has room for `cols` x `rows`. It gets its own tmux client: `screen.size`, then `screen.data` with a complete paint. |
+| `screen.resize` | `sid`, `viewer`, `cols`, `rows` | The room a viewer has changed. |
+| `screen.unsubscribe` | `sid`, `viewer` | Detach the viewer. The program is untouched. |
+| `screen.input` | `sid`, `viewer`, `data` | Base64 input from a viewer: keys, pastes, and mouse sequences (the wheel scrolls). Subject to the input lease. |
+| `screen.ack` | `sid`, `viewer`, `n` | The viewer has rendered `n` more bytes of `screen.data`. |
+| `screen.lease` | `sid`, `viewer`, `op` | `take`, `renew` or `release` the input lease. |
+| `screen.capture` | `sid`, `viewer`, `id` | Ask for the screen's text. Answered with `screen.capture.result`. |
+| `session.close` | `sid` | End the screen's program. |
 | `update` | — | Ask the machine to update its own binary. What that means is the product's. |
 
 ### Machine → control plane
@@ -76,11 +79,36 @@ A screen is a program in a terminal on the machine, identified by a control-plan
 | `t` | fields | meaning |
 |---|---|---|
 | `session.ready` | `sid` | The screen exists. |
-| `session.error` | `sid`, `error` | Something went wrong with this screen — **including that its session is gone**. See "A screen that dies". |
+| `session.error` | `sid`, `error` | The screen is gone or could not be made. See "A screen that dies". |
 | `var.push` | `sid`, `name`, `value` | An applet-owned variable changed. |
 | `rpc.call` | `sid`, `id`, `name`, `args` | The applet is calling the control plane. Must be answered with `rpc.result`. |
 | `rpc.result` | `sid`, `id`, `value`, `error` | The answer to a `rpc.call` from the control plane. |
-| `screen.data` | `sid`, `data` | Base64 terminal bytes for the attached viewer. |
+| `screen.size` | `sid`, `viewer`, `cols`, `rows` | The terminal's size from now on. Sent before any data at that size; the viewer shows exactly this size. |
+| `screen.data` | `sid`, `viewer`, `data` | Base64 terminal bytes for that viewer only. |
+| `screen.lease.state` | `sid`, `viewer`, `holder` | Who holds the input lease: `""` (free), `"driver"` (the applet), or a viewer id. Sent to every viewer on each change, and to a viewer whose input or `take` was refused. |
+| `screen.capture.result` | `sid`, `viewer`, `id`, `data`, `error` | Base64 text of the screen with up to 2000 lines of history, wrapped lines joined. |
+| `screen.error` | `sid`, `viewer`, `error` | Something failed for one viewer (it is not subscribed, its client ended). The screen itself is fine. |
+
+### Viewers
+
+`viewer` is an id the control plane chooses for each person watching a screen (`"driver"` is
+reserved). The window is the smallest room over the subscribed viewers; every viewer is told the
+size with `screen.size` and shows the terminal at exactly that size, centred in its view. With no
+viewers the window keeps its size.
+
+A viewer acknowledges what it has rendered with `screen.ack`. The connector stops reading a viewer's
+client once 256 KiB are unacknowledged; tmux then stops sending it every change and repaints it whole
+when it catches up, so a slow viewer gets a fresh screen instead of a backlog, and never slows the
+others. The viewer `""` is a single shared viewer that never acknowledges.
+
+### The input lease
+
+A screen's input is free or held by one party. Input from a viewer on a free screen takes the lease;
+input or `renew` keeps it; it lapses 3 s after the last renewal, on `release`, or when the viewer
+unsubscribes. Input or `take` from anyone else while it is held is refused and answered with
+`screen.lease.state`, so a viewer can show who is typing. The applet takes the lease around input
+that must not be interleaved (a paste and its Enter) and its input is refused while a viewer holds
+it. A viewer that keeps typing renews by typing; one that only reads should `release`.
 
 ### Adoption, and why it exists
 
@@ -109,11 +137,10 @@ only cure will be restarting something by hand.
 ## What an applet is given
 
 The applet is JavaScript, supplied by the control plane, running on the machine in a sandbox with no
-network and no filesystem of its own. It reaches the host through one global — `connector`, with the
-product's own name as an alias:
+network and no filesystem of its own. It reaches the host through one global, `connector`:
 
 ```
-connector.term.read() / .write(data) / .onChange(fn)
+connector.term.read() / .write(data) / .hold(on) / .onChange(fn)
 connector.own(name, initial)   // this applet owns it; the control plane mirrors it
 connector.watch(name)          // the control plane owns it; this applet observes it
 connector.expose(name, fn)     // the control plane may call this
@@ -121,13 +148,12 @@ connector.call(name, args)     // call the control plane; returns a thenable
 connector.log(message)
 ```
 
-A command applet (a product's own command tree, optional) is additionally given `command`, `http`,
-`exec`, `fs` and `print`.
-
 That list is short on purpose. Every product-specific feature belongs in an applet, which the
 control plane serves and can change today; a new host primitive means shipping a new binary to every
 machine, so adding one is a rare and deliberate act. A general capability (`exec` gaining a working
 directory) is right; a business-specific one (`gitPush()`) is not.
+
+`write` and `hold` return false when a viewer holds the input lease.
 
 `onChange` fires on screen changes **and** on a periodic heartbeat, because a dialog nobody is
 touching produces no change at all and still has to be answered.

@@ -1,9 +1,15 @@
-// The host API a screen applet is given, and how the engine finds it.
+// The host API a screen applet is given: the one global `connector` the runtime installs (see
+// cli/runtime/api.go), typed for the engine and the drivers.
 //
-// The host is implemented in Go (goja bindings) and installs exactly one global. Its NAME is
-// branded — MicroTeams installs `microteams`, another product installs its own — so nothing in this
-// repository may hardcode one. The engine resolves it once, preferring the neutral `connector` and
-// falling back to the known brands, which is what lets the same built driver run under any of them.
+//   host.term.read()          the visible screen
+//   host.term.write(data)     types data; false when refused (a person holds the input lease)
+//   host.term.hold(on)        takes or releases the input lease for the applet; false when refused
+//   host.term.onChange(fn)    every screen change, and every ~1.2 s
+//   host.own / watch          variables the control plane mirrors / owns
+//   host.expose / call        functions the control plane calls / answers
+//   host.log(message)
+//
+// Example: if (host.term.hold(true)) { host.term.write('hi') }
 
 /** A script-owned variable the host mirrors up to the control plane. */
 export interface Owned<T> {
@@ -20,13 +26,11 @@ export interface Watched<T> {
 export interface Terminal {
   /** The current visible screen. */
   read(): string
-  /** Keystrokes / control sequences. Long writes are chunked by the host, not here. */
-  write(data: string): void
-  /**
-   * Called on every screen change AND on a periodic heartbeat (~1.2s). The heartbeat matters more
-   * than it looks: a dialog nobody is touching produces no change at all, and it still has to be
-   * answered.
-   */
+  /** Keystrokes and control sequences; false when refused or failed. */
+  write(data: string): boolean
+  /** Take (true) or release (false) the input lease; false while a person holds it. */
+  hold(on: boolean): boolean
+  /** Every screen change and a ~1.2 s heartbeat, so a dialog nobody touches is still answered. */
   onChange(fn: () => void): void
 }
 
@@ -41,14 +45,4 @@ export interface Host {
 
 declare const globalThis: Record<string, any>
 
-/**
- * The one global, whatever this deployment calls it. Resolved at load time and never again: the
- * host installs it before running the script, and a driver that cannot find it is not going to
- * recover by looking later.
- */
-export const host: Host = (() => {
-  const g: any = globalThis
-  const found = g.connector || g.microteams
-  if (!found) throw new Error('micro-connector: no host global found (connector / microteams)')
-  return found as Host
-})()
+export const host: Host = (globalThis as any).connector

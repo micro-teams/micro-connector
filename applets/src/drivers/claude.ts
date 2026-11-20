@@ -15,6 +15,7 @@ import {
   parseOption,
   readCursorOptions,
   readOptions,
+  send,
   SHIFT_TAB,
   tail as tailOf,
 } from '../engine/driver'
@@ -58,8 +59,6 @@ function observe(screen: string): Observation {
   // is mostly emptiness, and a naive last-16-lines tail would miss the footer entirely.
   const tail = tailOf(screen, 16).split('\n')
   const tailStr = tail.join('\n')
-
-  if (/Pane is dead \(status/.test(tailStr)) return { kind: 'dead' }
 
   // A real choice dialog: a "❯ N." cursor + a dialog footer (or the trust gate) + a contiguous
   // 1,2,3,… block. All three, so a numbered list inside ordinary output cannot masquerade as one.
@@ -111,7 +110,8 @@ function observe(screen: string): Observation {
   // mentioned tokens, and idle on the first frames of a turn, before any tokens are counted.
   const busyFooter = /…\s*\([^)]*\b(?:\d+[hms]|tokens?)\b[^)]*\)/i.test(tailStr)
 
-  const hasUI = /\? for shortcuts|for agents/.test(tailStr) || tail.filter((l) => l.trim()).length > 3
+  // The prompt's footer: the shortcut hint, or the permission-mode line that replaces it.
+  const hasUI = /\? for shortcuts|for agents|permissions on|mode on|shift\+tab to cycle/i.test(tailStr)
   return { kind: 'open', working: orange || anySpinner || busyFooter, hasUI, bandRows } as Observation & {
     bandRows: number
   }
@@ -255,8 +255,7 @@ defineDriver({
       // without this check a /login would be typed straight into the code prompt.
       const urlNow = capturedUrl || findOAuthUrl(ctx.screen)
       if (!loginIssued && !urlNow) {
-        ctx.write('/login')
-        ctx.write(ENTER)
+        send('/login')
         loginIssued = true
       }
       return
@@ -299,21 +298,16 @@ defineDriver({
       }
       return true
     },
-    // Two writes, not one: the command text and its submit, the same way a person sends it.
-    compact: () => {
-      host.term.write('/compact')
-      host.term.write(ENTER)
-      return true
-    },
+    compact: () => send('/compact'),
+    // The account's usage limits, painted by Claude Code itself.
+    usage: () => send('/usage'),
     // Start the interactive login explicitly, for a control plane that would rather drive it than
     // wait for the idle kick (e.g. after re-pointing settings at the official endpoint). Same shape
     // as compact. Submit the captured OAuth code with the ordinary `say` — a bracketed paste with a
     // deferred Enter is exactly what a pasted code needs, and it is already the engine's blessed path.
     login: () => {
-      host.term.write('/login')
-      host.term.write(ENTER)
       loginIssued = true
-      return true
+      return send('/login')
     },
   },
 })

@@ -221,7 +221,9 @@ step "open a screen, and let the applet announce itself"
 HEARD="$WORK/heard.txt"; : >"$HEARD"
 if [ "$LEG" = "fake" ]; then
   APPLET="claude"
-  PROGRAM="while IFS= read -r line; do printf '%s\n' \"\$line\" >> $HEARD; done"
+  # It paints the footer the Claude Code driver takes as a prompt, since the driver types nothing
+  # before the program shows one.
+  PROGRAM="printf '? for shortcuts\\n'; while IFS= read -r line; do printf '%s\\n' \"\$line\" >> $HEARD; done"
   SCREEN_ENV='{}'
 elif [ "${LEG#pi:}" != "$LEG" ]; then
   APPLET="pi"
