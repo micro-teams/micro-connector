@@ -78,20 +78,28 @@ func (b Brand) Getenv(name string) string { return os.Getenv(b.Env(name)) }
 //     for the socket (the sessions are gone too) but it means the connector comes back to a
 //     directory it does not own if something else got there first during boot.
 //
-// $XDG_RUNTIME_DIR is what this is for — per-user, 0700, and already there when a person is logged
-// in. It is NOT there for a system service that starts at boot before any login, so the fallback
-// is a path under $HOME rather than back to /tmp. Only with neither does it use the temp dir, so a
-// process with no home still runs.
+// It must also be the SAME path for every process of the user, whatever environment that process
+// was started with, because the service and the commands a person runs in a shell meet at this
+// socket. It used to prefer $XDG_RUNTIME_DIR, and that split them on a live machine: the service, a
+// systemd system unit, has no $XDG_RUNTIME_DIR and hosted its screens under $HOME, while a login
+// shell has /run/user/<uid>, so `status` looked there, always reported no screens, and left a stray
+// directory behind. So the path is under $HOME alone, which every process of the user agrees on.
+// Only without a home does it use the temp dir, so a process with no home still runs.
 func (b Brand) RuntimePath() string {
-	if dir := os.Getenv("XDG_RUNTIME_DIR"); dir != "" {
-		if fi, err := os.Stat(dir); err == nil && fi.IsDir() {
-			return filepath.Join(dir, b.RuntimeDir)
-		}
-	}
 	if home, err := os.UserHomeDir(); err == nil && home != "" {
 		return filepath.Join(home, ".local", "state", b.RuntimeDir)
 	}
 	return filepath.Join(os.TempDir(), b.RuntimeDir+"-"+strconv.Itoa(os.Getuid()))
+}
+
+// XDGRuntimePath is where RuntimePath pointed for a process that had $XDG_RUNTIME_DIR (a user
+// service, a connector run from a shell), or "" for one that has none. Kept for the same reason as
+// LegacyRuntimePath: an in-place update must find the tmux server such a process left running.
+func (b Brand) XDGRuntimePath() string {
+	if dir := os.Getenv("XDG_RUNTIME_DIR"); dir != "" {
+		return filepath.Join(dir, b.RuntimeDir)
+	}
+	return ""
 }
 
 // LegacyRuntimePath is where RuntimePath used to be: under the temp dir. Kept so an in-place update

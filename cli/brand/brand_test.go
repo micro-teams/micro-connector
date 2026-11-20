@@ -26,19 +26,34 @@ func setHome(t *testing.T, dir string) {
 // /tmp is world-writable, so "<brand>-<uid>" is a name anything can take first, and it is a tmpfs,
 // so it is empty at boot and the race is run again every time the machine starts. The loser of that
 // race cannot open its own socket, and what a person sees is an agent that will not open.
-func TestRuntimePathPrefersTheRuntimeDir(t *testing.T) {
-	run := t.TempDir()
-	t.Setenv("XDG_RUNTIME_DIR", run)
+func TestRuntimePathIsUnderHomeNotTmp(t *testing.T) {
+	home := t.TempDir()
+	setHome(t, home)
+	t.Setenv("XDG_RUNTIME_DIR", "")
 
 	got := Current.RuntimePath()
-	if want := filepath.Join(run, Current.RuntimeDir); got != want {
-		t.Fatalf("with XDG_RUNTIME_DIR set: got %q, want %q", got, want)
+	if want := filepath.Join(home, ".local", "state", Current.RuntimeDir); got != want {
+		t.Fatalf("got %q, want %q", got, want)
 	}
 }
 
-// Set but pointing nowhere is the case a system service hits: systemd exports nothing, or logind
-// has not made /run/user/<uid> yet because nobody has logged in. Trusting the variable blindly
-// would put the socket in a directory that does not exist.
+// The service and a person's shell must meet at one socket. The service, a systemd system unit,
+// has no $XDG_RUNTIME_DIR; a login shell has /run/user/<uid>. When the path followed that variable,
+// `status` in a shell looked in /run/user/<uid>, reported no screens while the service hosted
+// several under $HOME, and left a stray directory behind.
+func TestRuntimePathIsTheSameWithOrWithoutXDGRuntimeDir(t *testing.T) {
+	setHome(t, t.TempDir())
+	t.Setenv("XDG_RUNTIME_DIR", "")
+	service := Current.RuntimePath()
+
+	t.Setenv("XDG_RUNTIME_DIR", t.TempDir())
+	if shell := Current.RuntimePath(); shell != service {
+		t.Fatalf("a login shell resolves %q, the service %q", shell, service)
+	}
+}
+
+// A runtime dir set but pointing nowhere is the case a system service hits at boot: logind has not
+// made /run/user/<uid> yet because nobody has logged in. The path does not depend on it at all.
 func TestRuntimePathFallsBackToHomeNotTmp(t *testing.T) {
 	t.Setenv("XDG_RUNTIME_DIR", filepath.Join(t.TempDir(), "not-there"))
 	home := t.TempDir()
@@ -56,6 +71,20 @@ func TestRuntimePathStillAnswersWithNothingSet(t *testing.T) {
 	setHome(t, "")
 	if got := Current.RuntimePath(); got == "" {
 		t.Fatal("returned no path at all")
+	}
+}
+
+// Where a build that followed $XDG_RUNTIME_DIR put the socket, so an update can find it; nothing
+// for a process without one.
+func TestXDGRuntimePathIsWhereTheRuntimeDirPointed(t *testing.T) {
+	run := t.TempDir()
+	t.Setenv("XDG_RUNTIME_DIR", run)
+	if got, want := Current.XDGRuntimePath(), filepath.Join(run, Current.RuntimeDir); got != want {
+		t.Fatalf("got %q, want %q", got, want)
+	}
+	t.Setenv("XDG_RUNTIME_DIR", "")
+	if got := Current.XDGRuntimePath(); got != "" {
+		t.Fatalf("without XDG_RUNTIME_DIR: got %q, want none", got)
 	}
 }
 
