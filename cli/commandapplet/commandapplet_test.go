@@ -1,3 +1,5 @@
+// Tests for the command applet: commands and flags become a cobra tree, handlers run, http goes
+// through the given client, and fs stays inside its root.
 package commandapplet
 
 import (

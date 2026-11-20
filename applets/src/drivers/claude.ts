@@ -1,8 +1,11 @@
-// Claude Code, as a declaration.
+// Claude Code, as a declaration: what Claude Code 2.1 paints (its gates, its working and idle
+// footers, compaction, the login flow) and nothing about how to act on it, which is the engine's.
 //
-// Everything here is a statement about what Claude Code paints — verified against real 2.1.x
-// screens. Everything about HOW to act on it (relative cursor movement, split frames, deferred
-// submit, chunked writes) belongs to the engine, deliberately: those are the parts that broke.
+// Mirrors, besides the engine's variables: compact ('' | 'running' | 'done'), compactPct,
+// subagents (spinner rows besides the foreground one), and in login mode oauthUrl and loginState
+// ('' | 'awaitingCode' | 'success'). Login mode is on while the control plane's variable `mode` is
+// 'login'. Commands: choose(n) answers the dialog on screen by option number; compact; usage
+// (/usage); login (/login; the code is then sent with say).
 
 import {
   chooseByLabel,
@@ -85,7 +88,7 @@ function observe(screen: string): Observation {
     }
   }
 
-  // Older builds print "esc to interrupt" only while the FOREGROUND turn is working.
+  // Some builds print "esc to interrupt" while the foreground turn is working.
   const orange = /esc to interrupt/.test(tailStr)
 
   // A row that is actively working leads with an animated braille spinner (U+2801–U+28FF). This is
@@ -123,21 +126,13 @@ defineDriver({
 
   gates: [
     {
-      // The folder-trust gate on a fresh cwd. Wording varies by version, and so does the SHAPE.
-      //
-      // It used to be answered with a bare Enter, on the belief that the default was the safe
-      // option. Newer Claude Code paints it as an unnumbered list with the cursor on "No, exit" —
-      // so that Enter quit Claude Code, and the pane died three seconds after launch. Every agent
-      // on a folder it had not been trusted with before was dead on arrival.
-      //
-      // So: pick by LABEL, never by position, in whichever shape this version uses. A bare Enter
-      // is left only for the shape that has no cursor to move at all.
+      // The folder-trust gate on a fresh directory. Its wording and shape vary by version, and the
+      // cursor can start on "No, exit", so it is answered by label; only a dialog with no cursor
+      // at all is answered with Enter.
       name: 'folder trust',
       when: /I trust this folder|created or one you trust|Do you trust/i,
       every: 1,
       act: (c) => {
-        // A dialog with no cursor anywhere is not one that can be steered — older versions painted
-        // exactly that, and there Enter IS the answer. Everywhere else, pick by label.
         if (!/[❯>]\s+\S/.test(c.screen)) {
           c.write(ENTER)
           return
@@ -239,11 +234,10 @@ defineDriver({
     return out
   },
 
-  // Keep Claude in bypass-permissions mode — the peer of what --dangerously-skip-permissions starts
-  // in, and the most permissive. It drifts out of it over time, and an older driver actively cycled
-  // it AWAY into auto mode. Bypass is in the Shift+Tab cycle, so hunt for it; only if a full cycle
-  // passes without it appearing (it can be disabled) settle for auto. Only act while a mode line is
-  // actually on screen, so a transient frame cannot cycle away from a good mode.
+  // Keep Claude Code in bypass-permissions mode, the mode --dangerously-skip-permissions starts in,
+  // which it can drift out of. Bypass is in the Shift+Tab cycle, so cycle until it shows; when a
+  // full cycle passes without it (it can be disabled), settle for auto. Act only while a mode line
+  // is on screen, so a transient frame cannot cycle away from a good mode.
   onIdle: (ctx) => {
     // Login mode: an ALREADY-onboarded machine lands at the main prompt, not logged in — kick off
     // /login once. A fresh machine never reaches here: its theme/method screens are dialogs the gates
@@ -276,10 +270,8 @@ defineDriver({
   },
 
   commands: {
-    // Answer the dialog currently on screen by option NUMBER, for a control plane relaying a
-    // person's click. Resolved to that option's label and then moved to relatively — the number
-    // says which option, never how many keys to press. (The old driver counted keystrokes from an
-    // imagined top of the list, which is the bug that made it press "No, exit".)
+    // Answer the dialog on screen by option number, for a control plane relaying a person's click:
+    // the number names the option, whose label is then moved to relatively.
     choose: (n: unknown) => {
       const want = parseInt(String(n), 10) || 1
       const screen = host.term.read()

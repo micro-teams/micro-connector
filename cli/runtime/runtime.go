@@ -13,7 +13,8 @@
 //
 //	New(term Terminal, bus Bus) *Runtime
 //	(*Runtime).Run(ctx) error         runs the loop until ctx ends; call it once, in its own goroutine.
-//	(*Runtime).Load(source string)    replaces the applet in a fresh VM, dropping the old one's state.
+//	(*Runtime).Load(source string)    replaces the applet in a fresh VM, dropping the old one's state
+//	                                  except the values of the control plane's variables.
 //	(*Runtime).SetVar(name, value)    a control-plane variable changed (delivered to watch listeners).
 //	(*Runtime).Invoke(id, name, args) the control plane calls an exposed function; answered on the
 //	                                  bus with ReplyServer.
@@ -108,7 +109,13 @@ func (r *Runtime) reset() {
 	r.vm = goja.New()
 	r.vm.SetFieldNameMapper(goja.TagFieldNameMapper("json", true))
 	r.owned = map[string]any{}
-	r.watched = map[string]*watchedVar{}
+	// The control plane's variables keep their values across a reload; only the old applet's
+	// listeners go.
+	watched := map[string]*watchedVar{}
+	for name, w := range r.watched {
+		watched[name] = &watchedVar{value: w.value}
+	}
+	r.watched = watched
 	r.exposed = map[string]goja.Callable{}
 	r.pending = map[string]*pendingCall{}
 	r.onChange = nil

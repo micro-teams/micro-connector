@@ -1,21 +1,31 @@
-// Package commandapplet runs the server-supplied CLI applet — a bundle of JavaScript that defines
-// a product's own command tree and handles each command. It replaces the old Restish/OpenAPI
-// command generation: instead of mirroring every operation 1:1 (noise an agent cannot navigate),
-// the applet declares a small, purpose-built set of commands whose handlers call the backend and
-// local tools.
+// Package commandapplet runs a command applet: JavaScript from the control plane that defines a
+// product's own command-line tree and handles each command. The control plane can then change the
+// commands without shipping a binary, and an agent gets a small, purposeful set of commands rather
+// than every endpoint of an API.
 //
-// It runs the applet in a fresh, short-lived goja VM with a synchronous host API (see
-// src/runtime/host.d.ts in the applets module for the contract):
+// The applet runs once per invocation in a fresh goja VM with a synchronous host API, under the
+// global `connector` and, as well, the brand's name:
 //
-//	<global>.command(spec)   register a command (the "describe" phase, at load)
-//	<global>.http(req)       one authenticated, blocking HTTP call to the backend
-//	<global>.fs.*            local files, sandboxed to a configured root
-//	<global>.exec(cmd,args)  run a local subprocess (e.g. git)
-//	<global>.print(...)      write to stdout
+//	command(spec)                register a command: {name, short, long, flags: [{name, type:
+//	                             "string" | "int" | "bool", help, required, default}], run(ctx),
+//	                             commands: [subcommand specs]}; run receives {flags, args}
+//	http({method, path, query, body})  one authenticated, blocking call to the control plane:
+//	                             {status, body} (JSON parsed when it is JSON)
+//	exec(cmd, args, {cwd})       run a local program: {code, stdout, stderr}
+//	fs.read/write/list/exists/mkdir/remove(path, ...)  files under Options.FsRoot only
+//	print(...)                   write a line to Options.Out
 //
-// Load() runs the applet and collects the registered commands; CobraCommands() turns them into a
-// cobra tree whose leaves dispatch back into the applet's handlers (the "run" phase). Everything is
-// synchronous — the applet is a one-shot process, so there is no event loop or promise machinery.
+//	Load(source, Options) (*Applet, error)   runs the applet and collects its commands.
+//	(*Applet).CobraCommands() []*cobra.Command  the commands as a cobra tree; each leaf runs the
+//	                                            applet's handler.
+//	Options{Client, APIBase, FsRoot, Out}   the authenticated client and base for http, the fs root
+//	                                        (the working directory when empty), the print target
+//	                                        (stdout when nil).
+//
+// Example:
+//
+//	a, err := commandapplet.Load(src, commandapplet.Options{Client: c, APIBase: base})
+//	root.AddCommand(a.CobraCommands()...)
 package commandapplet
 
 import (
@@ -33,16 +43,16 @@ import (
 
 	"github.com/dop251/goja"
 
-	"github.com/micro-teams/micro-connector/cli/brand"
 	"github.com/spf13/cobra"
+
+	"github.com/micro-teams/micro-connector/cli/brand"
 )
 
-// Options configures a loaded applet's host bindings.
 type Options struct {
-	Client  *http.Client // authenticated client for the http primitive (see the apiauth package)
-	APIBase string       // control-plane base URL; http paths are relative to it
-	FsRoot  string       // sandbox root for microteams.fs; defaults to the working directory
-	Out     io.Writer    // microteams.print target; defaults to os.Stdout
+	Client  *http.Client
+	APIBase string
+	FsRoot  string
+	Out     io.Writer
 }
 
 // Applet is a loaded CLI applet: a goja VM plus the commands it registered.
@@ -100,7 +110,6 @@ func Load(source string, opts Options) (*Applet, error) {
 	return a, nil
 }
 
-// CobraCommands builds the cobra tree for every command the applet registered.
 func (a *Applet) CobraCommands() []*cobra.Command {
 	cmds := make([]*cobra.Command, 0, len(a.roots))
 	for _, c := range a.roots {
@@ -140,9 +149,6 @@ func (a *Applet) install() error {
 	must(fs.Set("mkdir", a.jsFsMkdir))
 	must(fs.Set("remove", a.jsFsRemove))
 	must(mt.Set("fs", fs))
-	// The same arrangement the screen runtime uses: a neutral global that every product's applets
-	// can rely on, plus the brand's own name as an alias so applets written against one product
-	// keep working. A shared applet cannot hardcode a name that differs per product.
 	if err := a.vm.Set("connector", mt); err != nil {
 		return err
 	}
@@ -240,7 +246,7 @@ func (a *Applet) invoke(c *cmdSpec, cc *cobra.Command, args []string) error {
 	return nil
 }
 
-// --- microteams.http --------------------------------------------------------
+// --- http --------------------------------------------------------
 
 func (a *Applet) jsHTTP(call goja.FunctionCall) goja.Value {
 	req := call.Argument(0).ToObject(a.vm)
@@ -295,7 +301,7 @@ func (a *Applet) jsHTTP(call goja.FunctionCall) goja.Value {
 	return out
 }
 
-// --- microteams.exec --------------------------------------------------------
+// --- exec --------------------------------------------------------
 
 func (a *Applet) jsExec(call goja.FunctionCall) goja.Value {
 	name := call.Argument(0).String()
@@ -328,7 +334,7 @@ func (a *Applet) jsExec(call goja.FunctionCall) goja.Value {
 	return res
 }
 
-// --- microteams.fs (sandboxed to fsRoot) ------------------------------------
+// --- fs (sandboxed to fsRoot) ------------------------------------
 
 // resolve maps an applet path to a real path inside fsRoot, defeating traversal: the path is
 // cleaned as if rooted at "/", so any leading ".." that would escape is collapsed away first.

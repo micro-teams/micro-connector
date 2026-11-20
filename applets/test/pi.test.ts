@@ -1,3 +1,4 @@
+// The pi declaration, driven frame by frame against a fake terminal.
 import { test } from 'node:test'
 import assert from 'node:assert/strict'
 import { makeHost, runDriver } from './fake-host'

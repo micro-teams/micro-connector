@@ -1,20 +1,13 @@
-// Codex, as a declaration.
+// Codex, as a declaration. It is separate from Claude Code's because what differs between the two
+// (gates, working screens, option lists) is exactly what a shared declaration would get wrong.
 //
-// Deliberately NOT folded into the Claude declaration. The two programs share a skeleton — mirrored
-// variables, paste-then-submit, viewer awareness, busy/idle — and that skeleton is the engine. What
-// they do not share is every part that costs money to get wrong: their gates, what a working screen
-// looks like, and how their option lists behave. Assuming those are the same produces an
-// abstraction that fits neither, and the failure is invisible: a screenshot of a driver that has
-// silently stopped working looks exactly like one that works.
+// The control plane may set the variable `operatorPrompt`: standing instructions prepended once,
+// to the first message. Codex has no system prompt, and sending them at launch would start a turn
+// on its own. Commands: usage (/status).
 
-import { tail as tailOf, defineDriver, ENTER, Observation, send } from '../engine/driver'
+import { tail as tailOf, defineDriver, ENTER, host, Observation, send } from '../engine/driver'
 
-// The standing operator instructions. The control plane substitutes the real text for this
-// placeholder before serving the file. Codex has no system prompt, and sending these as its initial
-// prompt makes the agent start working on its own at launch — so they are prepended to the FIRST
-// message instead. On a resumed session they are already in the history; sending them once more is
-// harmless.
-const OPERATOR_PROMPT = '__MT_OPERATOR_PROMPT__'
+const operatorPrompt = host.watch<string>('operatorPrompt')
 let sentOperatorPrompt = false
 
 defineDriver({
@@ -54,9 +47,10 @@ defineDriver({
   },
 
   beforeSay: (text) => {
-    if (sentOperatorPrompt || OPERATOR_PROMPT.slice(0, 5) === '__MT_') return text
+    const prompt = operatorPrompt.get()
+    if (sentOperatorPrompt || !prompt) return text
     sentOperatorPrompt = true
-    return OPERATOR_PROMPT + '\n\n' + text
+    return prompt + '\n\n' + text
   },
 
   // Codex paints its session and usage limits for /status.

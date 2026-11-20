@@ -1,3 +1,22 @@
+// WSL support. A per-user service needs systemd, which WSL2 runs only when /etc/wsl.conf asks for it
+// in its [boot] section, and which runs a user's units unattended only with lingering on.
+//
+//	IsWSL() bool          the kernel says Microsoft/WSL (/proc/sys/kernel/osrelease).
+//	HasSystemd() bool     systemd is PID 1 (/run/systemd/system exists).
+//	EnsureSystemd() (SystemdStatus, error)
+//	                      on WSL without systemd, sets [boot] systemd = true in /etc/wsl.conf (root),
+//	                      changing no other line: SystemdNeedsRestart, since only the distro's next
+//	                      start (`wsl --shutdown` on Windows) applies it, and installing a unit before
+//	                      then cannot work. SystemdActive when systemd already runs (or wsl.conf
+//	                      already asks for it); SystemdNotApplicable off WSL.
+//	EnableLinger() error  `loginctl enable-linger $USER`, so the user's units run without a login.
+//
+// Example:
+//
+//	switch st, err := service.EnsureSystemd(); {
+//	case err != nil: return err
+//	case st == service.SystemdNeedsRestart: fmt.Println("run `wsl --shutdown` in Windows, then again")
+//	}
 package service
 
 import (
@@ -9,9 +28,6 @@ import (
 	"strings"
 )
 
-// IsWSL reports whether this process is running inside Windows Subsystem for Linux. WSL2's kernel
-// identifies itself in /proc/sys/kernel/osrelease (e.g. "...-microsoft-standard-WSL2"), which is the
-// standard, documented way to detect it — there is no syscall or env var for this.
 func IsWSL() bool {
 	if runtime.GOOS != "linux" {
 		return false
@@ -24,51 +40,21 @@ func IsWSL() bool {
 	return strings.Contains(s, "microsoft") || strings.Contains(s, "wsl")
 }
 
-// HasSystemd reports whether systemd is actually running as this machine's init (PID 1), the
-// standard check freedesktop.org documents: systemd bind-mounts /run/systemd/system into every
-// mount namespace it manages, so its presence means systemd — not just "installed", but "is init
-// right now". WSL2 does not have this by default; it needs an explicit opt-in (see EnsureSystemd).
 func HasSystemd() bool {
 	_, err := os.Stat("/run/systemd/system")
 	return err == nil
 }
 
-// SystemdStatus is what EnsureSystemd found and did.
 type SystemdStatus int
 
 const (
-	// SystemdActive means systemd is already PID 1 — nothing to do, proceed with the normal
-	// systemd --user install path.
 	SystemdActive SystemdStatus = iota
-	// SystemdNotApplicable means this isn't WSL (or isn't Linux at all) and HasSystemd() is false:
-	// EnsureSystemd only knows how to fix the WSL case, so it made no change. A caller on real Linux
-	// without systemd needs a different init-system backend entirely, which is outside this helper.
 	SystemdNotApplicable
-	// SystemdNeedsRestart means wsl.conf was just changed to enable systemd, but that only takes
-	// effect on the NEXT time this WSL distro boots. Nothing inside the current WSL session can
-	// trigger that restart (`wsl --shutdown` has to run on the Windows side); the caller must tell
-	// the operator to run it and re-invoke afterward.
 	SystemdNeedsRestart
 )
 
-// bootSystemdRe matches an existing "systemd = <value>" line inside wsl.conf's [boot] section —
-// case-insensitive key per WSL's own ini parser, optional spaces around "=", trailing comment
-// allowed. Capturing the whole line lets EnsureSystemd replace only this one key and leave every
-// other line (including unrelated tools' own boot config) byte-for-byte untouched.
 var bootSystemdRe = regexp.MustCompile(`(?i)^\s*systemd\s*=\s*(\S+)`)
 
-// EnsureSystemd makes systemd available as WSL's PID 1 if this is WSL and it is not already —
-// the prerequisite for reusing the exact same systemd --user install path this package already
-// uses on real Linux. It edits only the "systemd" key inside wsl.conf's [boot] section (a boolean,
-// see the doc comment on why that is safe to write unconditionally, unlike [boot]'s free-text
-// "command" key which may already hold a user's own script and would be destroyed by a naive
-// overwrite). Every other line of wsl.conf — including a pre-existing "command=" — is preserved.
-//
-// Does not, and cannot, restart WSL itself: a change here only takes effect on this distro's next
-// boot (`wsl --shutdown` from Windows, then reopening it). Call this, check the returned status,
-// and if it is SystemdNeedsRestart, stop and tell the operator to restart WSL and re-run — do not
-// proceed to install a systemd --user unit in the same process, since systemd is not actually
-// running yet and the install would fail confusingly.
 func EnsureSystemd() (SystemdStatus, error) {
 	if !IsWSL() {
 		return SystemdNotApplicable, nil
@@ -146,9 +132,6 @@ func setBootSystemdTrue(content string) (result string, changed bool) {
 	return strings.Join(out, "\n"), true
 }
 
-// EnableLinger makes the current user's systemd --user instance start at boot and outlive their
-// login sessions — required for a systemd --user unit to run unattended, on WSL exactly as on real
-// Linux. Idempotent: `loginctl enable-linger` on an already-lingering user is a no-op success.
 func EnableLinger() error {
 	u := os.Getenv("USER")
 	if u == "" {

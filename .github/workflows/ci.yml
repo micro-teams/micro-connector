@@ -7,9 +7,9 @@ on:
     branches: ["main"]
   workflow_dispatch:
 
-# What is worth testing here is not that the code compiles — it is that the drivers still understand
-# the screens they are pointed at. That is why the interesting jobs (real Claude Code against a mock
-# model, in a container with a real tmux) are the ones being built out next; see docs/.
+# Unit tests for the drivers and the Go library on Linux, macOS and Windows, and the testbed: a
+# connector built from the library driving real programs (a fake one, Claude Code, pi) in a real
+# tmux against the reference control plane.
 
 jobs:
   applets:
@@ -23,7 +23,7 @@ jobs:
       - uses: actions/setup-node@v7
         with:
           node-version: "22"
-      - run: npm ci || npm install
+      - run: npm ci
       - run: npm run typecheck
       - run: npm test
       - name: Upload the built drivers
@@ -48,17 +48,11 @@ jobs:
         run: |
           command -v tmux >/dev/null || sudo apt-get install -y -qq tmux
           go vet ./...
-          # -race, because this is the most concurrent code in the organisation and none of it was
-          # being checked for races: a screen manager dispatching from a socket goroutine into
-          # terminals, transports reconnecting underneath it, and a viewer relay reading while the
-          # program writes. A data race there does not crash — it corrupts a terminal or drops a
-          # message, months later, on someone else's machine.
+          # -race: screens, viewers, the lease and the transport all run concurrently, and a race
+          # there corrupts a terminal or drops a message instead of crashing.
           go test -race ./...
 
-  # macOS gets the exact same job as Linux, not a narrowed one: it has a real tmux (via Homebrew)
-  # and creack/pty has a real Darwin implementation, so screens genuinely work there — this is what
-  # makes "macOS should work unchanged" a tested claim instead of an assumption, the same gap that
-  # WSL support above exists to close for Linux-under-Windows.
+  # macOS has a real tmux and pty, so it runs the same tests as Linux.
   go-macos:
     name: cli (build + tests, macos)
     runs-on: macos-latest
@@ -76,13 +70,8 @@ jobs:
           go vet ./...
           go test -race ./...
 
-  # Native Windows has no tmux/pty backend at all (screens are ErrUnsupported there by design — see
-  # terminal.ErrUnsupported), so this is deliberately narrower than the Linux `go` job: no tmux
-  # install, no -race (Windows' race detector needs a C toolchain this runner doesn't carry). What it
-  # exists to catch is what cross-compiling from Linux cannot: real Windows build/vet/test failures
-  # (path handling, the service package's Windows-only branches, wsl.conf helpers that must no-op
-  # cleanly off Linux) — the same class of "assumed to work, never actually run" gap that WSL support
-  # was added specifically to close.
+  # Windows cannot host screens (terminal.ErrUnsupported); this proves the library builds and the
+  # rest of it passes there. No -race: the runner has no C toolchain for it.
   go-windows:
     name: cli (build + tests, windows)
     runs-on: windows-latest
@@ -99,16 +88,9 @@ jobs:
           go vet ./...
           go test ./...
 
-  # The job this repository exists for. `fake` is the deterministic baseline — if it is red, we broke
-  # something. The real-Claude legs answer a different question: whether Claude Code changed under
-  # us. The pinned one is required, because pinned means it can only break when we change something;
-  # `installer` follows the latest release and is advisory, since an upstream UI change is
-  # intelligence worth having rather than a reason to block a merge.
-  # macOS gets the same legs as Linux, not a subset: it has a real tmux (Homebrew) and node/go both
-  # run natively, so there is no structural reason the reference connector wouldn't work there too —
-  # and "should work on macOS" stays an assumption until something actually runs it. Native Windows
-  # has no matrix entry: it cannot host a screen at all (see terminal.ErrUnsupported), and this whole
-  # testbed is built around driving one, so there is nothing here for it to run.
+  # The testbed legs: `fake` is the deterministic baseline; `npm:<version>` and `pi:<version>` run a
+  # pinned real program against a mock model and are required; `installer` follows the latest
+  # Claude Code release and is advisory. Windows has no leg because it cannot host a screen.
   testbed:
     name: testbed (${{ matrix.leg }}, ${{ matrix.os }})
     runs-on: ${{ matrix.os }}

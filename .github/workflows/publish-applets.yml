@@ -38,7 +38,7 @@ jobs:
           scope: "@micro-teams"
 
       - name: Install
-        run: npm ci || npm install
+        run: npm ci
 
       # Never publish a driver that has not been checked: a broken screen driver does not fail
       # loudly on a machine, it just quietly stops understanding what it is looking at.

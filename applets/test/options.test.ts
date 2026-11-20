@@ -1,4 +1,5 @@
-// The regression tests for the most expensive bug this repository knows about.
+// Tests for reading and answering option dialogs: the selection wraps, so every move is relative to
+// the visible cursor.
 import { test } from 'node:test'
 import assert from 'node:assert/strict'
 import { chooseByLabel, parseOption, readOptions } from '../src/engine/options'
