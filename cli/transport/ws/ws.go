@@ -1,10 +1,8 @@
 // Package ws carries the protocol over a resident WebSocket: one connection, dialled out, kept up
 // for as long as the machine is.
 //
-// This is the transport for a product whose screens are long-lived and whose control plane must be
-// able to reach them at any moment — a message can arrive at any time, so somebody has to be
-// listening. The peer of transport/httppoll, which suits the opposite shape: one command, one
-// screen, no daemon.
+// Screens are long-lived and a control plane must be able to reach them at any moment, so somebody
+// has to be listening.
 //
 // It always dials out, so it works from behind NAT with nothing listening on the machine, and it
 // reconnects with capped backoff and heartbeats while up. It knows nothing about what the messages

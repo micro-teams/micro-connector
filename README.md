@@ -36,7 +36,7 @@ docs/       the contract between a control plane and a connector
 ```
 
 Implementing a control plane? [`docs/protocol.md`](docs/protocol.md) is the specification, and
-[`testbed/server.py`](testbed/server.py) is the same thing you can run.
+[`testbed/server`](testbed/server/main.go) is the same thing you can run.
 
 ## Using it
 
@@ -53,12 +53,12 @@ go get github.com/micro-teams/micro-connector/cli@v0.1.0
 brand.Current = brand.Brand{Name: "yourthing", EnvPrefix: "YOURTHING", /* … */}
 
 tm, _ := terminal.NewManager()
-conn := ws.New(controlURL, token, apiBase)      // or httppoll, for a one-shot command
+conn := ws.New(controlURL, token, apiBase)
 mgr := screen.NewManager(ctx, conn, tm)
 _ = conn.Run(ctx, mgr.Dispatch)
 ```
 
-`testbed/cli` is a complete working connector in 72 lines, and exists to keep that claim honest.
+[`testbed/connector`](testbed/connector/main.go) is a complete working connector in 70 lines, and exists to keep that claim honest.
 
 **The screen drivers** — serve them from your control plane:
 
@@ -106,7 +106,7 @@ anticipated.
 The **wire protocol** is versioned separately and is at **1**. It changes only when an older peer
 could not survive the message set, which is rarer than a release — see
 [`docs/protocol.md`](docs/protocol.md), the specification, with a runnable reference implementation
-beside it in [`testbed/server.py`](testbed/server.py).
+beside it in [`testbed/server`](testbed/server/main.go).
 
 ## License
 

@@ -1,7 +1,7 @@
 # The contract
 
 What a control plane and a connector say to each other, and what each may assume of the other. This
-document is the durable half of the specification; `testbed/server.py` is the executable half, and
+document is the durable half of the specification; `testbed/server` is the executable half, and
 the two are kept in step by the end-to-end test that runs against it.
 
 Read this if you are implementing a control plane. If you are implementing a connector, use the Go
@@ -10,17 +10,8 @@ library — it already speaks all of this.
 ## The shape of it
 
 A machine dials **out**. Nothing dials in, no port is opened, and everything below travels over one
-transport of the control plane's choosing:
-
-- a **resident WebSocket** (`cli/transport/ws`) if screens are long-lived and the control plane must
-  reach them at any moment — a message can arrive whenever, so somebody has to be listening;
-- **HTTP polling** (`cli/transport/httppoll`) if the work is a single command that drives one screen
-  and exits, where a connection to maintain is a liability rather than an asset.
-
-Both are in the library, and a product picks one by handing it to the screen manager.
-
-The message set is identical either way. A transport that changes the messages is a fork, not an
-implementation.
+resident WebSocket (`cli/transport/ws`): screens are long-lived and the control plane must reach them
+at any moment, so the machine keeps a connection open and reconnects whenever it drops.
 
 Every message is one JSON object with a `t` field naming its type, and only the fields that type
 uses. Unknown types must be ignored; unknown fields must be ignored. Both rules exist so an older
@@ -177,7 +168,7 @@ touching produces no change at all and still has to be answered.
 
 ## The reference implementation
 
-`testbed/server.py` implements all of the above in a few hundred lines of standard-library Python,
+`testbed/server` implements all of the above in a few hundred lines of Go,
 and `testbed/e2e.sh` drives a real connector against it — including a real Claude Code — on every
 change. If this document and that server ever disagree, the server is right and this document is a
 bug.

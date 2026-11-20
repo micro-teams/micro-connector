@@ -68,22 +68,22 @@ cleanup() {
 trap cleanup EXIT
 
 step "build the applets and a connector made only of the library"
-(cd "$ROOT/applets" && npm ci --silent >/dev/null 2>&1 || npm install --silent >/dev/null 2>&1; npm run build >/dev/null)
+(cd "$ROOT/applets" && npm ci --silent >/dev/null && npm run build >/dev/null)
 mkdir -p "$ROOT/testbed/bin"
-(cd "$ROOT/testbed/cli" && go build -o "$ROOT/testbed/bin/testconn" .)
+(cd "$ROOT/testbed" && go build -o bin/testconn ./connector && go build -o bin/testserver ./server)
 pass "built"
 
 step "start the reference control plane"
-APPLET_DIR="$ROOT/applets/dist" PORT="$PORT" python3 "$ROOT/testbed/server.py" >"$WORK/server.log" 2>&1 &
+"$ROOT/testbed/bin/testserver" -addr "127.0.0.1:$PORT" -applets "$ROOT/applets/dist" >"$WORK/server.log" 2>&1 &
 SRV_PID=$!
 for _ in $(seq 1 50); do curl -fsS "$BASE/test/state" >/dev/null 2>&1 && break; sleep 0.2; done
 curl -fsS "$BASE/test/state" >/dev/null || { cat "$WORK/server.log"; fail "the control plane never came up"; }
 pass "control plane up on $PORT"
 
 step "enrol a machine and connect it"
-# TMPDIR points at this run's own directory: the tmux socket path is derived from it, so the test
-# cannot reach a connector running on the same machine for real. That has gone wrong before.
-TMPDIR="$WORK" "$ROOT/testbed/bin/testconn" --base "$BASE" >"$WORK/conn.log" 2>&1 &
+# HOME and TMPDIR point at this run's own directory: the connector's tmux socket and state live
+# under them, so the test never reaches a tmux server it did not start.
+HOME="$WORK/connhome" TMPDIR="$WORK" XDG_RUNTIME_DIR="" "$ROOT/testbed/bin/testconn" --base "$BASE" >"$WORK/conn.log" 2>&1 &
 CONN_PID=$!
 for _ in $(seq 1 50); do grep -q "enrolled as" "$WORK/conn.log" 2>/dev/null && break; sleep 0.2; done
 grep -q "enrolled as" "$WORK/conn.log" || { cat "$WORK/conn.log"; fail "the machine never enrolled"; }

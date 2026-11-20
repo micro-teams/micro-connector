@@ -646,8 +646,7 @@ func (c *cappedBuffer) String() string { return c.buf.String() }
 func (c *cappedBuffer) Len() int       { return c.buf.Len() }
 
 // busAdapter maps one screen's runtime.Bus onto sid-tagged protocol messages. The runtime knows
-// nothing about the control plane, and this knows nothing about how the messages travel — which is
-// what lets the same applet run over a resident WebSocket here and over one-shot HTTP elsewhere.
+// nothing about the control plane, and this knows nothing about how the messages travel.
 type busAdapter struct {
 	conn protocol.Transport
 	sid  string

@@ -1,11 +1,8 @@
 // Package protocol is the language a connector and a control plane speak: the message set, and the
 // version number that lets two ends of different ages recognise each other.
 //
-// It is deliberately separate from any transport. One product carries these messages over a resident
-// WebSocket; another consumer of this connector drives one screen to completion over HTTP polling
-// inside a one-shot command. The messages are the same either way, and nothing here may assume
-// otherwise — the moment the protocol knows how it is being carried, the second transport becomes
-// a fork rather than an implementation.
+// It is separate from the transport that carries it (transport/ws), so the screen manager and its
+// tests depend only on the message set.
 package protocol
 
 import "context"

@@ -15,10 +15,10 @@ updates:
       cli-minor:
         update-types: ['minor', 'patch']
 
-  # The testbed's own module: it replaces the cli module with ../../cli, so only its other
+  # The testbed's own module: it replaces the cli module with ../cli, so only its other
   # dependencies move here.
   - package-ecosystem: 'gomod'
-    directory: '/testbed/cli'
+    directory: '/testbed'
     schedule:
       interval: 'weekly'
     groups:
