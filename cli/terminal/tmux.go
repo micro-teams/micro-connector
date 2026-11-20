@@ -9,6 +9,7 @@ import (
 	"errors"
 	"fmt"
 	"github.com/micro-teams/micro-connector/cli/brand"
+	"net"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -82,17 +83,21 @@ func NewManager() (*Manager, error) {
 	// surviving sessions. A random dir per process would strand them on an orphan
 	// socket (which is exactly what broke in-place update before this).
 	dir := brand.Current.RuntimePath()
-	// An update in place must arrive back at the socket the previous build left running. That build
-	// put it under the temp dir, so if a live socket is still there, keep using it for this process
-	// rather than starting a second tmux server and orphaning whatever it is hosting. New machines
-	// and later restarts get the new path; nobody loses a session in the crossing.
-	if legacy := brand.Current.LegacyRuntimePath(); legacy != dir {
-		if _, err := os.Stat(filepath.Join(legacy, "t.sock")); err == nil {
-			dir = legacy
+	// An update in place must arrive back at the socket the previous build left running. Earlier
+	// builds put it under $XDG_RUNTIME_DIR when the process had one, and before that under the temp
+	// dir, so if a tmux server still answers in either, keep using it for this process rather than
+	// starting a second one and orphaning whatever it is hosting. New machines and later restarts
+	// get the new path; nobody loses a session in the crossing. Only a server that answers counts:
+	// a socket file left by a dead one, or a directory with no socket (which `status` from a login
+	// shell used to create), would otherwise send this process somewhere the service is not.
+	for _, old := range []string{brand.Current.XDGRuntimePath(), brand.Current.LegacyRuntimePath()} {
+		if old != "" && old != dir && answers(filepath.Join(old, "t.sock")) {
+			dir = old
+			break
 		}
 	}
-	// Before this moved off /tmp, the directory was one that always worked. Now it is under $HOME (or
-	// $XDG_RUNTIME_DIR), and those can be unwritable, missing, or hidden from the process — systemd's
+	// Before this moved off /tmp, the directory was one that always worked. Now it is under $HOME,
+	// and that can be unwritable, missing, or hidden from the process — systemd's
 	// ProtectHome does exactly that. Failing here would mean a connector that will not start at all,
 	// which is a far worse day than a socket in a less private place, so the old location is the
 	// last resort rather than the error.
@@ -113,6 +118,16 @@ func NewManager() (*Manager, error) {
 		return nil, fmt.Errorf("terminal: write config: %w", err)
 	}
 	return &Manager{bin: bin, sock: filepath.Join(dir, "t.sock"), conf: conf}, nil
+}
+
+// answers reports whether something accepts connections on the unix socket at path.
+func answers(path string) bool {
+	c, err := net.DialTimeout("unix", path, time.Second)
+	if err != nil {
+		return false
+	}
+	_ = c.Close() // only the accept mattered
+	return true
 }
 
 // Disabled returns a Manager that never actually hosts anything: every operation (Spawn,

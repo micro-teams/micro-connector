@@ -2,6 +2,7 @@ package terminal
 
 import (
 	"bytes"
+	"net"
 	"os"
 	"path/filepath"
 	"strings"
@@ -278,37 +279,97 @@ func TestNewManagerFallsBackWhenTheRuntimeDirCannotBeMade(t *testing.T) {
 	}
 }
 
+// listenAt stands in for a tmux server an earlier build left running: something answering on
+// <dir>/t.sock.
+func listenAt(t *testing.T, dir string) string {
+	t.Helper()
+	if err := os.MkdirAll(dir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	sock := filepath.Join(dir, "t.sock")
+	ln, err := net.Listen("unix", sock)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = ln.Close() })
+	return sock
+}
+
 // The crossing: an update in place must come back to the socket the previous build is running.
 //
-// The old build put it under the temp dir. A new one that went straight to $HOME would start a
-// SECOND tmux server and orphan everything the first is hosting — every screen on the machine,
-// still running, attached to a socket nobody looks at again. This is the claim the release rests
-// on, so it is asserted rather than commented.
+// Old builds put it under the temp dir, and later under $XDG_RUNTIME_DIR when the process had one.
+// A new one that went straight to $HOME would start a SECOND tmux server and orphan everything the
+// first is hosting — every screen on the machine, still running, attached to a socket nobody looks
+// at again. This is the claim the release rests on, so it is asserted rather than commented.
 func TestAnUpdateKeepsUsingTheSocketTheOldBuildLeftRunning(t *testing.T) {
 	if _, err := findTmux(); err != nil {
 		t.Skip("no tmux available")
 	}
-	tmp := shortTempDir(t)
-	t.Setenv("TMPDIR", tmp)
-	t.Setenv("XDG_RUNTIME_DIR", "")
+	for name, old := range map[string]func() string{
+		"temp dir":        brand.Current.LegacyRuntimePath,
+		"XDG runtime dir": brand.Current.XDGRuntimePath,
+	} {
+		t.Run(name, func(t *testing.T) {
+			t.Setenv("TMPDIR", shortTempDir(t))
+			t.Setenv("XDG_RUNTIME_DIR", shortTempDir(t))
+			t.Setenv("HOME", shortTempDir(t))
+			want := listenAt(t, old())
+
+			m, err := NewManager()
+			if err != nil {
+				t.Fatalf("NewManager: %v", err)
+			}
+			if m.sock != want {
+				t.Fatalf("went to %q instead of %q — the sessions the old build is hosting are orphaned",
+					m.sock, want)
+			}
+		})
+	}
+}
+
+// The service and a person's shell must meet at one socket, and the shell must not leave anything
+// behind on the way. On a live machine the service (a systemd system unit, no $XDG_RUNTIME_DIR)
+// hosted its screens under $HOME while `status` in a login shell looked in /run/user/<uid>,
+// reported no screens, and created the directory there. Left over from that: the stray directory,
+// and possibly a socket file whose server is long gone. Neither may pull the shell away.
+func TestAShellFindsTheSocketTheServiceUses(t *testing.T) {
+	if _, err := findTmux(); err != nil {
+		t.Skip("no tmux available")
+	}
+	t.Setenv("TMPDIR", shortTempDir(t))
 	t.Setenv("HOME", shortTempDir(t))
-
-	// What the previous build left behind: its runtime dir, with a socket in it.
-	legacy := brand.Current.LegacyRuntimePath()
-	if err := os.MkdirAll(legacy, 0o700); err != nil {
-		t.Fatal(err)
-	}
-	if err := os.WriteFile(filepath.Join(legacy, "t.sock"), nil, 0o600); err != nil {
-		t.Fatal(err)
-	}
-
-	m, err := NewManager()
+	t.Setenv("XDG_RUNTIME_DIR", "")
+	service, err := NewManager()
 	if err != nil {
-		t.Fatalf("NewManager: %v", err)
+		t.Fatalf("NewManager as the service: %v", err)
 	}
-	if want := filepath.Join(legacy, "t.sock"); m.sock != want {
-		t.Fatalf("went to %q instead of %q — the sessions the old build is hosting are orphaned",
-			m.sock, want)
+
+	run := shortTempDir(t)
+	t.Setenv("XDG_RUNTIME_DIR", run)
+	shell, err := NewManager()
+	if err != nil {
+		t.Fatalf("NewManager in a login shell: %v", err)
+	}
+	if shell.sock != service.sock {
+		t.Fatalf("a login shell looks at %q, the service hosts at %q", shell.sock, service.sock)
+	}
+	if _, err := os.Stat(brand.Current.XDGRuntimePath()); !os.IsNotExist(err) {
+		t.Fatalf("the shell left %s behind (stat: %v)", brand.Current.XDGRuntimePath(), err)
+	}
+
+	// What a dead server leaves in the old place: a t.sock nothing answers on. It is not followed.
+	if err := os.MkdirAll(brand.Current.XDGRuntimePath(), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(brand.Current.XDGRuntimePath(), "t.sock"), nil, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	again, err := NewManager()
+	if err != nil {
+		t.Fatalf("NewManager beside a dead socket: %v", err)
+	}
+	if again.sock != service.sock {
+		t.Fatalf("followed the dead socket %q instead of the service's %q", again.sock, service.sock)
 	}
 }
 
