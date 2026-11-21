@@ -43,7 +43,7 @@ POST <base>/machine/enroll/poll    { "code": "ABC123" }
 ```
 
 The connector shows `approveUrl` to whoever is standing there and polls every `interval` seconds
-until the answer is not `pending`. What happens on that link — a human approving, a tenant's API
+(2 when the field is absent) until the answer is not `pending`. What happens on that link — a human approving, a tenant's API
 approving, a pre-issued credential being accepted — is the control plane's business entirely.
 
 The path prefix is the product's (`EnrollBase`); the field names above are not negotiable, because

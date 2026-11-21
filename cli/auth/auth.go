@@ -3,7 +3,8 @@
 // plane answers with the machine's credential. How the approval happens is the control plane's
 // business.
 //
-//	POST <base><EnrollBase>/start  {}            -> {"code", "approveUrl", "interval" (seconds, > 0)}
+//	POST <base><EnrollBase>/start  {}            -> {"code", "approveUrl", "interval"}
+//	                                                 (interval: seconds between polls, 2 when absent)
 //	POST <base><EnrollBase>/poll   {"code"}      -> {"status": "pending" | "approved" | "denied",
 //	                                                 "token", "machineId"}
 //
@@ -29,6 +30,9 @@ import (
 	"github.com/micro-teams/micro-connector/cli/brand"
 )
 
+// defaultInterval is the poll interval the protocol gives a start response without one.
+const defaultInterval = 2 * time.Second
+
 type startResp struct {
 	Code       string `json:"code"`
 	ApproveURL string `json:"approveUrl"`
@@ -52,11 +56,15 @@ func Login(ctx context.Context, base string, show func(approveURL string)) (*Res
 	if err := postJSON(ctx, base+brand.Current.EnrollBase+"/start", map[string]string{}, &sr); err != nil {
 		return nil, fmt.Errorf("auth: start: %w", err)
 	}
-	if sr.Code == "" || sr.ApproveURL == "" || sr.Interval <= 0 {
+	if sr.Code == "" || sr.ApproveURL == "" || sr.Interval < 0 {
 		return nil, fmt.Errorf("auth: incomplete start response %+v", sr)
 	}
 	show(sr.ApproveURL)
-	tick := time.NewTicker(time.Duration(sr.Interval) * time.Second)
+	interval := time.Duration(sr.Interval) * time.Second
+	if sr.Interval == 0 {
+		interval = defaultInterval
+	}
+	tick := time.NewTicker(interval)
 	defer tick.Stop()
 	for {
 		select {
