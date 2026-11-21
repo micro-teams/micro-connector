@@ -8,4 +8,4 @@
 // Example: fmt.Println("connector", cli.Version)
 package cli
 
-const Version = "0.1.11"
+const Version = "0.2.0"
