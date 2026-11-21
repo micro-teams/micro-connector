@@ -120,7 +120,8 @@ if [ "$LEG" != "fake" ]; then
   # Docker image's own build does it (see mock-server/mockserver's docker/Dockerfile) — their docs
   # page shows a different flag/subcommand for the separate -no-dependencies artifact, which is not
   # what this is.
-  java -jar "$MOCK_JAR" -p 1080 >"$WORK/mockserver.log" 2>&1 &
+  # From the run's own directory: MockServer writes its CA certificate into the working directory.
+  (cd "$WORK" && exec java -jar "$MOCK_JAR" -p 1080) >"$WORK/mockserver.log" 2>&1 &
   MOCK_PID=$!
   for _ in $(seq 1 60); do
     curl -fsS -X PUT "http://127.0.0.1:1080/mockserver/status" >/dev/null 2>&1 && break
