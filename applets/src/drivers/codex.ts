@@ -1,13 +1,20 @@
-// Codex, as a declaration. It is separate from Claude Code's because what differs between the two
-// (gates, working screens, option lists) is exactly what a shared declaration would get wrong.
+// Codex, as a declaration.
 //
-// The control plane may set the variable `operatorPrompt`: standing instructions prepended once,
-// to the first message. Codex has no system prompt, and sending them at launch would start a turn
-// on its own. Commands: usage (/status).
+// Deliberately NOT folded into the Claude declaration. The two programs share a skeleton — mirrored
+// variables, paste-then-submit, viewer awareness, busy/idle — and that skeleton is the engine. What
+// they do not share is every part that costs money to get wrong: their gates, what a working screen
+// looks like, and how their option lists behave. Assuming those are the same produces an
+// abstraction that fits neither, and the failure is invisible: a screenshot of a driver that has
+// silently stopped working looks exactly like one that works.
 
-import { tail as tailOf, defineDriver, ENTER, host, Observation, send } from '../engine/driver'
+import { tail as tailOf, defineDriver, ENTER, Observation } from '../engine/driver'
 
-const operatorPrompt = host.watch<string>('operatorPrompt')
+// The standing operator instructions. The control plane substitutes the real text for this
+// placeholder before serving the file. Codex has no system prompt, and sending these as its initial
+// prompt makes the agent start working on its own at launch — so they are prepended to the FIRST
+// message instead. On a resumed session they are already in the history; sending them once more is
+// harmless.
+const OPERATOR_PROMPT = '__MT_OPERATOR_PROMPT__'
 let sentOperatorPrompt = false
 
 defineDriver({
@@ -28,6 +35,7 @@ defineDriver({
   observe: (screen): Observation => {
     const tail = tailOf(screen, 16).split('\n')
     const tailStr = tail.join('\n')
+    if (/Pane is dead \(status/.test(tailStr)) return { kind: 'dead' }
     // Codex paints "esc to interrupt" only while a turn is running — the same kind of signal as
     // Claude's, on a different line.
     const working = /esc to interrupt/i.test(tailStr)
@@ -47,12 +55,12 @@ defineDriver({
   },
 
   beforeSay: (text) => {
-    const prompt = operatorPrompt.get()
-    if (sentOperatorPrompt || !prompt) return text
+    if (sentOperatorPrompt || OPERATOR_PROMPT.slice(0, 5) === '__MT_') return text
     sentOperatorPrompt = true
-    return prompt + '\n\n' + text
+    return OPERATOR_PROMPT + '\n\n' + text
   },
 
-  // Codex paints its session and usage limits for /status.
-  commands: { usage: () => send('/status') },
+  // Codex in full-auto never puts a choice dialog up, and nothing scrolls it away from the bottom
+  // that the engine needs to undo.
+  keepAtBottom: false,
 })

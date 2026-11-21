@@ -33,6 +33,7 @@ defineDriver({
 
   observe: (screen): Observation => {
     const tail = tailOf(screen, 8)
+    if (/Pane is dead \(status/.test(tail)) return { kind: 'dead' }
     const m = statusLine(screen)
     if (!m) return { kind: 'open', working: false, hasUI: false }
     if (m[1].indexOf('✕ exited') === 0) return { kind: 'dead' }

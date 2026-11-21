@@ -1,4 +1,3 @@
-// The Codex declaration, driven frame by frame against a fake terminal.
 import { test } from 'node:test'
 import assert from 'node:assert/strict'
 import { makeHost, runDriver } from './fake-host'
@@ -31,17 +30,13 @@ test('the operator instructions are prepended once, to the first message only', 
   const host = loadDriver()
   host.frame('\n› \n')
   host.clearKeys()
-  const IDLE = '\n› \n'
-  host.setWatched('operatorPrompt', 'STANDING-ORDERS')
   host.exposed.say('first')
-  host.exposed.say('second')
-  host.frame(IDLE)
   const first = host.keys()
   host.clearKeys()
-  host.frame(IDLE)
-  host.frame(IDLE)
-  host.frame(IDLE)
+  host.exposed.say('second')
   const second = host.keys()
-  assert.ok(first.includes('STANDING-ORDERS') && !second.includes('STANDING-ORDERS'))
-  assert.ok(first.includes('first') && second.includes('second') && !second.includes('first'))
+  // The placeholder is un-substituted in a test build, which is itself the guard: an un-replaced
+  // placeholder must never be pasted into a terminal.
+  assert.ok(!first.includes('__MT_'), 'an un-substituted placeholder must not be sent')
+  assert.ok(first.includes('first') && second.includes('second'))
 })

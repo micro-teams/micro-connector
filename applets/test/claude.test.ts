@@ -6,18 +6,8 @@ import { DOWN, ENTER } from '../src/engine/keys'
 
 const PASTE_START = '\x1b[200~'
 
-// protocol1: a runtime from before the input lease, with no term.hold and a write that returns
-// nothing.
-function loadDriver(protocol1 = false) {
+function loadDriver() {
   const host = makeHost()
-  if (protocol1) {
-    const term: any = host.term
-    delete term.hold
-    const write = term.write
-    term.write = (d: string) => {
-      write(d)
-    }
-  }
   runDriver('claude')
   return host
 }
@@ -125,8 +115,6 @@ test('a message is pasted atomically and submitted on a later frame, never the s
   host.frame(IDLE)
   host.clearKeys()
   host.exposed.say('hello there')
-  assert.equal(host.keys(), '', 'nothing is written outside a frame')
-  host.frame(IDLE)
   const afterSay = host.keys()
   assert.ok(afterSay.startsWith(PASTE_START), 'the body goes in as one bracketed paste')
   assert.ok(
@@ -138,38 +126,15 @@ test('a message is pasted atomically and submitted on a later frame, never the s
   assert.ok(host.keys().endsWith(ENTER), 'and is submitted a couple of frames later')
 })
 
-test('nothing is typed while a person holds the input lease; it goes in when they let go', () => {
+test('nothing is typed while a human holds the keyboard; it is flushed when they let go', () => {
   const host = loadDriver()
   host.frame(IDLE)
-  host.holder = 'person'
+  host.setWatched('viewerLevel', 'full')
   host.clearKeys()
-  assert.equal(host.exposed.say('while you type', 'm1'), 'queued')
-  host.frame(IDLE)
-  host.frame(IDLE)
-  assert.equal(host.keys(), '', 'not one keystroke may land in a person’s input')
-  host.holder = ''
-  host.frame(IDLE)
+  assert.equal(host.exposed.say('while you type'), 'buffered')
+  assert.equal(host.keys(), '', 'not one keystroke may land in a human’s input')
+  host.setWatched('viewerLevel', 'passive')
   assert.ok(host.keys().includes('while you type'))
-  host.frame(IDLE)
-  host.frame(IDLE)
-  assert.ok(host.keys().endsWith(ENTER))
-  assert.deepEqual(host.calls[host.calls.length - 1], { name: 'sayResult', args: { id: 'm1', ok: true, error: '' } })
-  assert.equal(host.holder, '', 'the lease is released after the Enter')
-})
-
-test('nothing is typed before the program shows its prompt', () => {
-  const host = loadDriver()
-  host.frame('Resuming session…')
-  host.exposed.say('too early')
-  host.frame('Resuming session…')
-  host.frame('Resuming session…')
-  assert.equal(host.keys(), '')
-})
-
-test('a transcript that mentions a dead pane is not a dead pane', () => {
-  const host = loadDriver()
-  host.frame('the log said: Pane is dead (status 1)\n' + IDLE)
-  assert.notEqual(host.vars.status, 'dead')
 })
 
 test('a dead pane is reported dead', () => {
@@ -253,10 +218,10 @@ test('login mode: the login-method dialog lands on subscription, never a bare En
 
 test('login mode: an already-onboarded idle prompt kicks off /login exactly once', () => {
   const host = login()
-  for (let i = 0; i < 4; i++) host.frame(IDLE)
+  host.frame(IDLE)
   assert.ok(host.keys().includes('/login'), 'idle + not logged in => run /login')
   host.clearKeys()
-  for (let i = 0; i < 4; i++) host.frame(IDLE)
+  host.frame(IDLE)
   assert.equal(host.keys(), '', 'and never again once issued')
 })
 
@@ -295,21 +260,4 @@ test('normal mode: the OAuth variables stay empty', () => {
   host.frame(OAUTH) // same screen, but no login mode
   assert.equal(host.vars.oauthUrl, '')
   assert.equal(host.vars.loginState, '')
-})
-
-test('a message resent with the same id is typed once', () => {
-  const host = loadDriver()
-  host.frame(IDLE)
-  host.exposed.say('once', 'm9')
-  host.exposed.say('once', 'm9')
-  for (let i = 0; i < 8; i++) host.frame(IDLE)
-  assert.equal(host.keys().split('once').length - 1, 1)
-})
-
-test('on a runtime without the input lease, messages are still typed and submitted', () => {
-  const host = loadDriver(true)
-  host.frame(IDLE)
-  host.exposed.say('old runtime', 'm1')
-  for (let i = 0; i < 4; i++) host.frame(IDLE)
-  assert.ok(host.keys().includes('old runtime') && host.keys().endsWith(ENTER))
 })

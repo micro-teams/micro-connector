@@ -106,9 +106,11 @@ others. The viewer `""` is a single shared viewer that never acknowledges.
 A screen's input is free or held by one party. Input from a viewer on a free screen takes the lease;
 input or `renew` keeps it; it lapses 3 s after the last renewal, on `release`, or when the viewer
 unsubscribes. Input or `take` from anyone else while it is held is refused and answered with
-`screen.lease.state`, so a viewer can show who is typing. The applet takes the lease around input
-that must not be interleaved (a paste and its Enter) and its input is refused while a viewer holds
-it. A viewer that keeps typing renews by typing; one that only reads should `release`.
+`screen.lease.state`, so a viewer can show who is typing. An applet may take the lease around input
+that must not be interleaved (`connector.term.hold`), and its input is refused while a viewer holds
+it. A viewer that keeps typing renews by typing; one that only reads should `release`. The drivers
+in `applets/` do not use the lease themselves: they buffer while the control plane sets their
+variable `viewerLevel` to `full`, which a control plane does while a person holds the lease.
 
 ### Adoption, and why it exists
 

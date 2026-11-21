@@ -1,21 +1,14 @@
-// Reading and answering the option dialogs the TUIs put up.
+// Reading and answering the option dialogs these TUIs put in the way.
 //
-// A selection wraps around, so pressing a key a fixed number of times from an imagined top lands on
-// whichever option the wrap leaves it at. This module therefore offers no absolute moves: it only
-// moves relative to the cursor that is visible, which cannot drift however the list wraps.
+// The single most expensive lesson in this repository lives here: THE SELECTION WRAPS. An earlier
+// driver moved to an option by pressing UP nine times ("go firmly to the top") and then stepping
+// down. On a two-option dialog nine UPs land on option 2 — an odd number of wraps — and the
+// following DOWN wraps back to option 1. Aiming at "Yes, I accept" arrived at "No, exit" every
+// single time, and the Enter quit Claude Code three seconds after launch. On a brand-new machine
+// the agent died before it could read anything.
 //
-//   clean(line)                       the line without box-drawing characters
-//   parseOption(line)                 `❯ 2. Yes, I accept` -> {n: 2, label: 'Yes, I accept'}, else null
-//   readOptions(screen)               the numbered options on screen, with the cursor's option
-//   readCursorOptions(screen)         an unnumbered list: the lines around the cursor, numbered by
-//                                     position
-//   chooseByLabel(write, screen, re)  moves toward the numbered option matching re, or confirms it
-//                                     when the cursor is already there: 'moved' | 'confirmed' |
-//                                     'absent' | 'not-ready'
-//   chooseNearCursorByLabel(write, screen, re)  the same for an unnumbered list ('no-list' when no
-//                                     cursor is on screen)
-//
-// Example: if (chooseByLabel(write, screen, /yes, i accept/i) === 'absent') { ... }
+// So this module offers no way to move to an absolute position. It only moves RELATIVE to where the
+// cursor actually is, which cannot drift no matter how the list wraps.
 
 import { DOWN, ENTER, UP } from './keys'
 
@@ -81,12 +74,16 @@ export function chooseByLabel(
 }
 
 /**
- * The same discipline, for a list whose options carry no numbers, such as
+ * The same discipline, for a list whose options carry no numbers.
+ *
+ * Claude Code's folder-trust gate lost its numbering — it now paints
  *
  *     ❯ No, exit
  *       Yes, I trust this folder
  *
- * with the cursor on the destructive option.
+ * with the cursor on the DESTRUCTIVE option, and [parseOption] sees no options at all. The gate used
+ * to answer this with a bare Enter, on the belief that the default was the safe one; against this
+ * shape that Enter quits Claude Code, and the pane dies three seconds after launch.
  *
  * Only the lines DIRECTLY around the cursor are considered part of the list, and a blank line ends
  * it. That is narrow on purpose: without numbers there is nothing that certainly marks an option,
@@ -97,6 +94,16 @@ export function chooseByLabel(
  */
 /**
  * The options of an UNNUMBERED list, read from around the cursor.
+ *
+ * Claude Code dropped the numbering from its gates: the folder-trust one and the
+ * bypass-permissions one both paint
+ *
+ *     ❯ No, exit
+ *       Yes, I accept
+ *
+ * with the cursor on the destructive option. [readOptions] sees nothing there, and a driver that
+ * can only read numbers does nothing at all on those frames — an agent that sits at "starting"
+ * forever, or one that answers with a bare Enter and quits.
  *
  * Only the lines DIRECTLY around the cursor count, and a blank line ends the list. That is narrow
  * on purpose: without numbers nothing certainly marks an option, so the further this reaches the

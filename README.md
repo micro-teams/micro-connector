@@ -41,8 +41,9 @@ flowchart LR
 - **Scrolling and copying through tmux.** The mouse wheel scrolls tmux's history (or reaches a
   full-screen program that asked for the mouse); `screen.capture` returns the text with history.
 - **Drivers.** `applets/` holds the engine and one declaration per program: its startup dialogs,
-  how to tell working from idle, and commands such as `compact` and `usage`. The engine types a
-  message only once the program shows its prompt and reports whether it was submitted.
+  how to tell working from idle, and commands such as `compact`. While a person is typing (the
+  control plane says so with the variable `viewerLevel`) the engine buffers what it would type, and
+  when they let go it returns the program to its live bottom.
 - **Lifecycle.** Install as a service (systemd, launchd, OpenRC, Windows), enrol with a code a person
   approves, update in place by downloading and re-executing; screens survive all of it.
 

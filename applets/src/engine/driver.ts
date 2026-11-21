@@ -1,29 +1,20 @@
-// The engine: everything that is the same whichever program is in the terminal.
+// The engine: everything that is the same no matter which program is in the terminal.
 //
-// A program's declaration (DriverSpec) says what its gates look like, how to tell working from idle,
-// and which extra functions the control plane may call. How the cursor moves, how a paste is
-// submitted and when input may be written belong to the engine, so a declaration cannot get them
-// wrong.
+// A program declaration says what its gates look like, how to tell working from idle, and which
+// extra functions the control plane may call. It does NOT get to say how the cursor moves, how a
+// paste is submitted, or how a gate is answered — those are where the bugs were, so the engine owns
+// them and a declaration cannot express the wrong thing.
 //
-//   defineDriver(spec)        runs the frame loop for one program and exposes `snapshot` and
-//                             `say(text, id?)` to the control plane, plus spec.commands. It mirrors
-//                             status (starting|busy|waiting|idle|dead), elapsed, tokens, question,
-//                             choices and spec.vars. `say` queues the text; once it is pasted and
-//                             submitted the engine calls the control plane's `sayResult({id, ok,
-//                             error})` when an id was given; a repeated id is ignored.
-//   send(text, mode)          queues input from a command, typed ('type') or pasted ('paste').
-//   tail(screen, n)           the last n painted lines.
-//   options helpers           chooseByLabel, chooseNearCursorByLabel, readOptions, parseOption,
-//                             readCursorOptions, clean (see options.ts); keys (see keys.ts).
-//
-// Example:
-//
-//   defineDriver({ name: 'sh', version: 1,
-//     observe: (s) => ({ kind: 'open', working: false, hasUI: /\$ $/.test(s) }),
-//     commands: { clear: () => send('clear') } })
+// What is shared (and was independently reimplemented in both production drivers before this):
+//   * the frame loop, fed by screen changes and a heartbeat
+//   * the mirrored variables a control plane expects (status, elapsed, tokens, question, choices)
+//   * viewer awareness: never type over a human, and never trust a screen they are scrolling
+//   * bracketed paste with a deferred submit
+//   * buffering commands while a human holds the keyboard, flushed when they let go
+//   * the busy/idle state machine, including "hold the last trustworthy verdict"
 
 import { host, Owned } from './host'
-import { ENTER, PASTE_END, PASTE_START } from './keys'
+import { ENTER, PASTE_END, PASTE_START, PGDN } from './keys'
 import {
   chooseByLabel,
   chooseNearCursorByLabel,
@@ -63,7 +54,7 @@ export interface GateContext {
   frame: number
   /** Answer a dialog by label. Moves on one frame, confirms on a later one. */
   choose(want: RegExp): void
-  write(data: string): boolean
+  write(data: string): void
 }
 
 export interface Gate {
@@ -85,7 +76,10 @@ export interface DriverContext {
   tail: string
   frame: number
   status: string
-  write(data: string): boolean
+  write(data: string): void
+  /** True while a human is scrolling or typing: the screen cannot be trusted or typed over. */
+  viewerActive(): boolean
+  viewerTyping(): boolean
 }
 
 export interface DriverSpec {
@@ -102,12 +96,14 @@ export interface DriverSpec {
   report?(ctx: DriverContext, vars: Record<string, Owned<any>>, o: Observation): void
   /** Pull "6m45s" / "19.2k" out of a working screen. Cleared automatically when not working. */
   progress?(ctx: DriverContext): { elapsed?: string; tokens?: string } | null
-  /** Called when the program is idle and no input is pending, e.g. to keep a mode selected. */
+  /** Called when the screen is idle and the viewer is passive — e.g. to keep a mode selected. */
   onIdle?(ctx: DriverContext): void
   /** Last chance to change a message before it is pasted (Codex prepends its operator prompt). */
   beforeSay?(text: string): string
   /** Extra functions the control plane may call, on top of snapshot/say. */
   commands?: Record<string, (...args: any[]) => any>
+  /** Scroll back to the live bottom when a human stops scrolling. Default true. */
+  keepAtBottom?: boolean
   /** How many lines count as "the tail". Default 16. */
   tailLines?: number
 }
@@ -130,27 +126,6 @@ export function tail(screen: string, n: number): string {
 
 const tailOf = tail
 
-/** How input reaches the program: a bracketed paste, or keys typed as they are. */
-export type InputMode = 'paste' | 'type'
-
-interface Pending {
-  text: string
-  mode: InputMode
-  id?: string
-}
-
-// The input queue. Module state, because each screen runs its driver in a VM of its own.
-const inputQueue: Pending[] = []
-
-/**
- * Queue text for the program, submitted with Enter once the program is ready for it. For commands:
- * `send('/compact', 'type')`.
- */
-export function send(text: string, mode: InputMode = 'type'): 'queued' {
-  inputQueue.push({ text, mode })
-  return 'queued'
-}
-
 export function defineDriver(spec: DriverSpec): void {
   const tailLines = spec.tailLines ?? 16
   const term = host.term
@@ -164,59 +139,77 @@ export function defineDriver(spec: DriverSpec): void {
   const extra: Record<string, Owned<any>> = {}
   for (const key of Object.keys(spec.vars ?? {})) extra[key] = host.own(key, spec.vars![key])
 
-  // --- input ----------------------------------------------------------------
-  // One entry at a time: written while the applet holds the input lease, then Enter a couple of
-  // frames later, because a TUI ingests a paste asynchronously and an Enter written with it is
-  // swallowed into the paste. The lease is held from the first write to the Enter, so a person's
-  // keys cannot land in between; while a person holds it, the entry waits. Nothing is written
-  // before the program shows its UI or while a dialog is up.
-  let inFlight: (Pending & { enterIn: number }) | null = null
+  const label = host.watch<string>('label')
+  label.onChange((v) => host.log('screen labelled: ' + v))
 
-  function report(p: Pending, ok: boolean, error?: string) {
-    if (p.id !== undefined) host.call('sayResult', { id: p.id, ok, error: error ?? '' })
+  // What the human viewer is doing, pushed by the UI:
+  //   'passive' — not touching it: the screen sits at the live bottom and can be believed
+  //   'scroll'  — reading history: the footer may be off screen, so believe nothing
+  //   'full'    — typing: never write into it
+  const viewerLevel = host.watch<string>('viewerLevel')
+  const viewerActive = () => {
+    const l = viewerLevel.get()
+    return l === 'scroll' || l === 'full'
   }
+  const viewerTyping = () => viewerLevel.get() === 'full'
 
-  function pump(status: string) {
-    if (inFlight) {
-      if (!term.hold(true)) return
-      if (--inFlight.enterIn > 0) return
-      const done = inFlight
-      inFlight = null
-      const ok = term.write(ENTER)
-      term.hold(false)
-      report(done, ok, ok ? undefined : 'the Enter could not be written')
-      return
+  // --- deferred submit ------------------------------------------------------
+  // After a paste the TUI ingests the body asynchronously, and a CR written too soon is swallowed
+  // INTO the paste: the text sits in the input box, perfectly visible, never sent. So a paste only
+  // arms this counter and the frame loop presses Enter a couple of frames later.
+  let submitIn = 0
+
+  // --- command buffering ----------------------------------------------------
+  // While a human is typing, a command from the control plane would collide with their keystrokes.
+  // Queue it and flush the moment they hand control back.
+  let queue: Array<() => unknown> = []
+  let cmdSince = false
+  function gated(fn: (...args: any[]) => any) {
+    return function (this: unknown, ...args: any[]): any {
+      const run = () => {
+        cmdSince = true
+        return fn.apply(null, args)
+      }
+      if (viewerTyping()) {
+        queue.push(run)
+        return 'buffered'
+      }
+      return run()
     }
-    if (!inputQueue.length || (status !== 'idle' && status !== 'busy')) return
-    if (!term.hold(true)) return
-    const next = inputQueue[0]
-    const body = next.mode === 'paste' ? PASTE_START + next.text + PASTE_END : next.text
-    if (!term.write(body)) {
-      term.hold(false)
-      return
-    }
-    inputQueue.shift()
-    inFlight = { ...next, enterIn: 2 }
   }
+  viewerLevel.onChange(() => {
+    if (!viewerTyping() && queue.length) {
+      const q = queue
+      queue = []
+      q.forEach((f) => f())
+    }
+  })
 
   // --- the frame loop -------------------------------------------------------
+  let stableBusy = false // the last verdict taken while the screen could be believed
+  let wasActive = false
   let frame = 0
 
   term.onChange(() => {
     frame++
     const screen = term.read()
     const tail = tailOf(screen, tailLines)
-    const ctx: DriverContext = { screen, tail, frame, status: statusVar.get(), write: (d) => term.write(d) }
-
-    // tmux's own marker for a program that exited is the pane's last painted line; matching it
-    // anywhere else would take text the program printed for its death.
-    const last = tail.split('\n').pop() ?? ''
-    if (/^Pane is dead \(status \d+/.test(last.trim())) {
-      statusVar.set('dead')
-      return
+    const ctx: DriverContext = {
+      screen,
+      tail,
+      frame,
+      status: statusVar.get(),
+      write: (d) => term.write(d),
+      viewerActive,
+      viewerTyping,
     }
 
-    // Gates first: while one is up the program is not going to do anything else.
+    if (submitIn > 0 && !viewerTyping()) {
+      if (--submitIn === 0) term.write(ENTER)
+    }
+
+    // Gates first: while one is up the program is not going to do anything else, and answering it
+    // is the only thing worth doing with this frame.
     for (const gate of spec.gates ?? []) {
       const gctx: GateContext = {
         screen,
@@ -224,26 +217,48 @@ export function defineDriver(spec: DriverSpec): void {
         frame,
         write: (d) => term.write(d),
         choose: (want) => {
-          // Numbered options first, then the unnumbered shape with a cursor.
+          // Numbered first, then the unnumbered shape. Claude Code dropped the numbers from its
+          // gates — both the folder-trust one and the bypass-permissions one now paint a bare list
+          // with the cursor on "No, exit" — and a driver that could only read numbers simply did
+          // nothing on those frames, which is an agent that sits at "starting" forever.
           if (chooseByLabel((d) => term.write(d), screen, want) === 'absent') {
             chooseNearCursorByLabel((d) => term.write(d), screen, want)
           }
         },
       }
       const up = typeof gate.when === 'function' ? gate.when(gctx) : gate.when.test(screen)
-      if (!up) continue
+      if (!up || viewerTyping()) continue
       if (frame % (gate.every ?? 2) === 0) gate.act(gctx)
-      statusVar.set('starting')
       return
     }
 
+    // A human who just stopped scrolling leaves the pane up in history; snap it back so the next
+    // sample sees the real footer rather than whatever they were reading.
+    const active = viewerActive()
+    if ((spec.keepAtBottom ?? true) && wasActive && !active) {
+      for (let i = 0; i < 12; i++) term.write(PGDN)
+    }
+    wasActive = active
+
     const o = spec.observe(screen)
     let st: string = o.kind
-    if (o.kind === 'open') st = o.working ? 'busy' : o.hasUI ? 'idle' : 'starting'
+    if (o.kind === 'open') {
+      let busy: boolean
+      if (!active) {
+        // Trustworthy sample: believe it, and remember it.
+        busy = !!o.working
+        stableBusy = busy
+        cmdSince = false
+      } else {
+        // Not trustworthy: hold the last verdict, but a command sent since then has probably
+        // started work, so count that as busy.
+        busy = stableBusy || cmdSince
+      }
+      st = busy ? 'busy' : o.hasUI ? 'idle' : 'starting'
+    }
     ctx.status = st
 
-    pump(st)
-    if (st === 'idle' && !inFlight && !inputQueue.length && spec.onIdle) spec.onIdle(ctx)
+    if (st === 'idle' && !active && spec.onIdle) spec.onIdle(ctx)
 
     statusVar.set(st)
     question.set(o.kind === 'waiting' ? o.question || '' : '')
@@ -264,19 +279,18 @@ export function defineDriver(spec: DriverSpec): void {
 
   // --- what the control plane may call --------------------------------------
   host.expose('snapshot', () => term.read())
-  // A message with an id is taken once: the control plane may resend one it never heard back about,
-  // and typing it twice would deliver it twice.
-  const seen = new Set<string>()
-  host.expose('say', (text: unknown, id?: unknown) => {
-    if (id !== undefined) {
-      if (seen.has(String(id))) return 'queued'
-      seen.add(String(id))
-    }
-    const body = spec.beforeSay ? spec.beforeSay(String(text)) : String(text)
-    inputQueue.push({ text: body, mode: 'paste', id: id === undefined ? undefined : String(id) })
-    return 'queued'
-  })
-  for (const name of Object.keys(spec.commands ?? {})) host.expose(name, spec.commands![name])
+  host.expose(
+    'say',
+    gated((text: unknown) => {
+      const body = spec.beforeSay ? spec.beforeSay(String(text)) : String(text)
+      term.write(PASTE_START + body + PASTE_END)
+      submitIn = 2
+      return true
+    }),
+  )
+  for (const name of Object.keys(spec.commands ?? {})) {
+    host.expose(name, gated(spec.commands![name]))
+  }
 
   host.call('screenReady', { driver: spec.name, version: spec.version }).then((ack) => {
     host.log('server acked screenReady: ' + JSON.stringify(ack))
