@@ -60,7 +60,7 @@ A screen is a program in a terminal on the machine, identified by a control-plan
 
 | `t` | fields | meaning |
 |---|---|---|
-| `session.create` | `sid`, `command`, `env`, `cols`, `rows`, `source`, `screen`, `adopt` | Open a screen of `cols` x `rows`. A session with this `sid` that is still running is **adopted** instead — see below. `source` is the applet's JavaScript; an adopted screen reloads it only when it differs from the one running. `screen` is an opaque per-screen token the connector puts in the program's environment. With `adopt` and no `command`, a screen that is not running is reported with `session.error`, never started. |
+| `session.create` | `sid`, `command`, `env`, `cols`, `rows`, `source`, `screen`, `adopt` | Open a screen of `cols` x `rows`. A session with this `sid` that is still running is **adopted** instead — see below. `source` is the applet's JavaScript; an adopted screen reloads it only when it differs from the one running. `screen` is an opaque per-screen token the connector puts in the program's environment. The program's environment also has `<PREFIX>_TMUX`, the tmux binary hosting it, and `TMPDIR`, a directory of its own. With `adopt` and no `command`, a screen that is not running is reported with `session.error`, never started. |
 | `var.set` | `sid`, `name`, `value` | Set a variable the applet observes. |
 | `rpc.call` | `sid`, `id`, `name`, `args` | Call a function the applet exposed. Answered with `rpc.result`. |
 | `rpc.result` | `sid`, `id`, `value`, `error` | Answer a call the applet made. **Every call must be answered**, or the applet waits forever. |

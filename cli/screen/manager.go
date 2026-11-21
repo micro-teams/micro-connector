@@ -234,10 +234,12 @@ func (m *Manager) hasSession(sid string) bool {
 	}
 }
 
-// environment is the program's environment: the screen's identity token, a private temp
-// directory, then the control plane's variables, which win.
+// environment is the program's environment: the screen's identity token, the tmux binary hosting
+// it (<PREFIX>_TMUX: a program that runs tmux, such as Claude Code copying a selection with
+// `tmux load-buffer`, needs the same binary as the server it is in, which may not be on its PATH),
+// a private temp directory, then the control plane's variables, which win.
 func (m *Manager) environment(msg protocol.Msg) ([]string, error) {
-	env := []string{}
+	env := []string{brand.Current.Env("TMUX") + "=" + m.tm.Bin()}
 	if msg.Screen != "" {
 		env = append(env, brand.Current.Env("SCREEN")+"="+msg.Screen)
 	}

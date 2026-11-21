@@ -24,6 +24,8 @@
 //	    an error, because a busy tmux is not a dead screen.
 //	(*Manager).LiveSessions() (int, error)
 //	    How many sessions the server has; 0 when no server runs.
+//	(*Manager).Bin() string
+//	    The tmux binary this manager runs.
 //	(*Manager).KillServer() error
 //	    Ends every session. For uninstalling and for tests, never for stopping a connector.
 //
@@ -194,6 +196,8 @@ func absent(err error) bool {
 	return strings.HasPrefix(te.msg, "can't find session") || strings.HasPrefix(te.msg, "no server running") ||
 		strings.HasPrefix(te.msg, "error connecting to")
 }
+
+func (m *Manager) Bin() string { return m.bin }
 
 func (m *Manager) KillServer() error {
 	if err := m.run("kill-server"); err != nil && !absent(err) {
