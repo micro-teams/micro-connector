@@ -1,9 +1,6 @@
-// The seam that lets a product dial somewhere other than the one configured URL.
-//
-// Tested against a real WebSocket server rather than a fake dialler, because the thing worth
-// pinning is what the loop reports back — and "the connection was held for a while" versus "the
-// handshake succeeded and it dropped" is a distinction only a real connection makes.
-
+// Tests for the WebSocket transport against a real WebSocket server: route choice per attempt, what
+// each attempt reports (a connection held versus one dropped right after the handshake is only
+// visible with a real connection), and dialling through NetDial.
 package ws
 
 import (

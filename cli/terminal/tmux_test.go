@@ -1,49 +1,45 @@
+// Tests for the terminal package against a real tmux. Every test runs its own tmux server under a
+// temporary HOME, TMPDIR and XDG_RUNTIME_DIR (see isolated), so the suite never reaches a server it
+// did not start; tests skip when no tmux is installed.
 package terminal
 
 import (
 	"bytes"
-	"net"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
 	"github.com/micro-teams/micro-connector/cli/brand"
 )
 
-// shortTempDir is t.TempDir(), except its path does not embed the calling test's name. That name
-// becomes part of a tmux socket's path here, and AF_UNIX has a real, short limit on that (108 bytes
-// on Linux, 104 on macOS) — a test with a long enough name (or nested subtests, which append
-// another path segment) pushes t.TempDir()'s own path past it and tmux fails with "File name too
-// long", nothing to do with the code under test. Not hypothetical: TestOpeningAScreenAfterTmux
-// DiedIsAnswered is exactly such a name, and hit precisely this on a real macOS CI runner.
+func needTmux(t *testing.T) {
+	t.Helper()
+	if _, err := findTmux(); err != nil {
+		t.Skip("no tmux available")
+	}
+}
+
+// shortTempDir is a temporary directory whose path does not contain the test's name: the tmux
+// socket lives inside it, and a unix socket path is limited to about 104 bytes.
 func shortTempDir(t *testing.T) string {
 	t.Helper()
 	dir, err := os.MkdirTemp("", "mc")
 	if err != nil {
-		t.Fatalf("shortTempDir: %v", err)
+		t.Fatal(err)
 	}
-	t.Cleanup(func() { _ = os.RemoveAll(dir) })
+	t.Cleanup(func() { os.RemoveAll(dir) })
 	return dir
 }
 
-// isolated builds a Manager whose tmux server is this test's alone.
-//
-// NewManager deliberately derives its socket from a STABLE per-user path, so that a restarted or
-// self-updated connector can find the sessions it left behind. A test that calls it bare therefore
-// gets the socket of whatever connector is running as this user — and these tests kill their server
-// when they are done. So `go test ./...` on a machine that hosts agents takes down every screen on
-// it. That is not hypothetical: it happened twice on 2026-07-31 and was investigated for hours as a
-// spontaneous tmux death, OOM included, before the test suite turned out to be the killer.
-//
-// So every input RuntimePath reads is pointed somewhere only this test knows about, and then the
-// socket it produced is CHECKED to be in there. The check is the part that lasts: TMPDIR alone was
-// enough when the runtime dir came from the temp dir, and stopped being enough the moment it moved
-// to $XDG_RUNTIME_DIR / $HOME. Without an assertion, that change was silent — the suite went on
-// passing while pointing at the live socket again.
+// isolated returns a Manager whose tmux server belongs to this test alone, and checks that its
+// socket really is inside the test's directory before anything can kill it.
 func isolated(t *testing.T) *Manager {
 	t.Helper()
+	needTmux(t)
 	dir := shortTempDir(t)
 	t.Setenv("TMPDIR", dir)
 	t.Setenv("XDG_RUNTIME_DIR", dir)
@@ -53,258 +49,228 @@ func isolated(t *testing.T) *Manager {
 		t.Fatalf("NewManager: %v", err)
 	}
 	if !strings.HasPrefix(m.sock, dir) {
-		t.Fatalf("this test's tmux server is at %q, outside %q — it would kill the live one", m.sock, dir)
+		t.Fatalf("the test's tmux server is at %q, outside %q", m.sock, dir)
 	}
+	t.Cleanup(func() { m.KillServer() })
 	return m
 }
 
-// TestHasSessionAndAdopt spins up a fully isolated private tmux server on its own
-// temp socket (never the live service's), so it cannot touch any running screen.
-// It verifies HasSession reflects an existing session and that Adopt wraps it
-// without spawning. Skipped when no tmux binary is available.
-func TestHasSessionAndAdopt(t *testing.T) {
-	if _, err := findTmux(); err != nil {
-		t.Skip("no tmux available")
-	}
-	m := isolated(t)
-	defer m.KillServer()
-
-	if m.HasSession("nope") {
-		t.Error("HasSession returned true for a nonexistent session")
-	}
-
-	sess, err := m.Spawn("t1", []string{"sh", "-c", "sleep 30"}, nil, 80, 24)
-	if err != nil {
-		t.Fatalf("Spawn: %v", err)
-	}
-	if !m.HasSession("t1") {
-		t.Error("HasSession returned false for a live session")
-	}
-
-	adopted := m.Adopt("t1")
-	if adopted == nil || adopted.name != "t1" {
-		t.Fatalf("Adopt returned %+v, want a Session named t1", adopted)
-	}
-
-	_ = sess.Close()
-	if m.HasSession("t1") {
-		t.Error("HasSession returned true after the session was closed")
-	}
-}
-
-// TestScrollHistory proves the live-screen scroll mechanism end-to-end against a real tmux:
-// a normal-buffer program's output is retained in tmux scrollback, ScrollUp enters
-// copy-mode and pages back into that history, and scrolling to the bottom leaves
-// copy-mode so the pane resumes following live output. This is the whole reason the
-// viewer drives copy-mode instead of sending PgUp/PgDn to the program.
-func TestScrollHistory(t *testing.T) {
-	if _, err := findTmux(); err != nil {
-		t.Skip("no tmux available")
-	}
-	m := isolated(t)
-	defer m.KillServer()
-
-	// Print 100 lines to the NORMAL screen buffer (sh uses no alternate screen), then
-	// idle — so tmux keeps all 100 in its scrollback even though only ~24 are visible.
-	s, err := m.Spawn("scroll1",
-		[]string{"sh", "-c", "for i in $(seq 1 100); do echo line$i; done; sleep 30"},
-		nil, 80, 24)
-	if err != nil {
-		t.Fatalf("Spawn: %v", err)
-	}
-	defer s.Close()
-
-	// Wait until the last line has been printed and is on screen.
-	deadline := time.Now().Add(5 * time.Second)
-	for !strings.Contains(screen(t, s), "line100") {
+func eventually(t *testing.T, what string, cond func() bool) {
+	t.Helper()
+	deadline := time.Now().Add(10 * time.Second)
+	for !cond() {
 		if time.Now().After(deadline) {
-			t.Fatalf("program never finished printing; last screen:\n%s", screen(t, s))
+			t.Fatalf("timed out waiting for %s", what)
 		}
 		time.Sleep(50 * time.Millisecond)
 	}
-
-	// Scrolling up must enter copy-mode and move off the live bottom.
-	s.ScrollUp(20)
-	if !s.copyMode {
-		t.Fatal("ScrollUp did not enter copy-mode")
-	}
-	if s.atBottom() {
-		t.Fatal("still at the live bottom after ScrollUp(20)")
-	}
-	// The scrolled view must reveal earlier history no longer on the live screen.
-	if got := screen(t, s); !strings.Contains(got, "line80") {
-		t.Errorf("scrolled view does not show earlier history (line80); got:\n%s", got)
-	}
-
-	// Scrolling far enough back down returns to the live bottom and leaves copy-mode.
-	s.ScrollDown(40)
-	if s.copyMode {
-		t.Error("copy-mode not left after scrolling back to the bottom")
-	}
-	if !s.atBottom() {
-		t.Error("not reported at the live bottom after scrolling down")
-	}
-
-	// ExitCopyMode is idempotent when already live.
-	s.ExitCopyMode()
-	if s.copyMode {
-		t.Error("copyMode still set after ExitCopyMode")
-	}
 }
 
-// screen is capture() for tests, which have no use for the error: a failed capture
-// shows up as an empty screen and the assertion that was waiting for content fails
-// on its own deadline.
-func screen(t *testing.T, s *Session) string {
+func format(t *testing.T, m *Manager, target, f string) string {
 	t.Helper()
-	out, err := s.capture()
+	out, err := m.output("display-message", "-p", "-t", target, f)
 	if err != nil {
-		return ""
+		t.Fatal(err)
 	}
-	return out
+	return strings.TrimSpace(out)
 }
 
-// TestWriteLongMessage is T-058: a long message a human sends is never delivered to the agent.
-//
-// It reaches the database and the sender's own screen, so it looks sent; what fails is the last
-// hop. The applet hands the whole message to `tmux send-keys -l -- <text>` in one go, and tmux
-// caps how long a single command may be:
-//
-//	script: term.write: terminal: write "s9dcde052": exit status 1: command too long
-//
-// Nothing upstream is told — the error goes to the connector's log, which nobody reads — so the
-// agent simply never hears what was said to it. That silence is the bug; the length limit is only
-// how it starts.
-//
-// The test therefore asserts both halves: the write must not fail, and the bytes must actually
-// arrive at the program. The program runs with `stty raw` because the tty line discipline has a
-// length limit of its own (~4KB per line in canonical mode) that would otherwise be mistaken for
-// this one.
-func TestWriteLongMessage(t *testing.T) {
-	if _, err := findTmux(); err != nil {
-		t.Skip("no tmux available")
-	}
+func TestHasSessionAdoptAndClose(t *testing.T) {
 	m := isolated(t)
-	defer m.KillServer()
-
-	out := t.TempDir() + "/heard.txt"
-	s, err := m.Spawn("long1", []string{"sh", "-c", "stty raw -echo; cat > " + out + "; sleep 30"},
-		nil, 80, 24)
+	if ok, err := m.HasSession("nope"); ok || err != nil {
+		t.Fatalf("HasSession with no server = %v, %v; want false, nil", ok, err)
+	}
+	s, err := m.Spawn("t1", []string{"sleep", "60"}, nil, 80, 24)
 	if err != nil {
-		t.Fatalf("Spawn: %v", err)
+		t.Fatal(err)
 	}
-	defer s.Close()
-	time.Sleep(500 * time.Millisecond) // let `stty raw` take effect before typing
-
-	// Comfortably past tmux's limit and a realistic size for a long human message. Half of it is
-	// Chinese: multi-byte runes are what a naive split corrupts, and most messages here are Chinese.
-	body := strings.Repeat("The quick brown fox jumps over the lazy dog. ", 250) +
-		strings.Repeat("这是一条很长的中文消息，用来确认分片不会把一个字劈成两半。", 250) // ~30KB
-	if err := s.Write([]byte(body)); err != nil {
-		t.Fatalf("Write of a %d-byte message failed: %v", len(body), err)
+	if ok, err := m.HasSession("t1"); !ok || err != nil {
+		t.Fatalf("HasSession of a live session = %v, %v", ok, err)
 	}
-
-	deadline := time.Now().Add(10 * time.Second)
-	for {
-		got, err := os.ReadFile(out)
-		if err == nil && len(got) >= len(body) {
-			if string(got[:len(body)]) != body {
-				t.Fatalf("the program received %d bytes but they are not what was sent", len(got))
-			}
-			return
-		}
-		if time.Now().After(deadline) {
-			t.Fatalf("the program received %d of %d bytes", len(got), len(body))
-		}
-		time.Sleep(100 * time.Millisecond)
+	// A session whose name only starts with another's is not that session.
+	if ok, _ := m.HasSession("t"); ok {
+		t.Fatal("HasSession matched a prefix")
+	}
+	if n, err := m.LiveSessions(); n != 1 || err != nil {
+		t.Fatalf("LiveSessions = %d, %v", n, err)
+	}
+	if err := m.Adopt("t1").Close(); err != nil {
+		t.Fatal(err)
+	}
+	if ok, err := m.HasSession("t1"); ok || err != nil {
+		t.Fatalf("HasSession after Close = %v, %v", ok, err)
+	}
+	if err := s.Close(); err != nil {
+		t.Fatalf("closing a session that is already gone: %v", err)
 	}
 }
 
-// TestChunkEnd covers the boundary case the long-message fix turns on: a chunk must never end in
-// the middle of a rune, because the two halves become arguments to two separate tmux commands and
-// neither is valid text.
+func TestConfigReachesAServerThatIsAlreadyRunning(t *testing.T) {
+	m := isolated(t)
+	if out, err := exec.Command(m.bin, "-S", m.sock, "-f", "/dev/null", "new-session", "-d", "-s", "old", "sleep 60").CombinedOutput(); err != nil {
+		t.Fatalf("start a server with no configuration: %v: %s", err, out)
+	}
+	again, err := NewManager()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := format(t, again, "=old:", "#{status} #{mouse} #{prefix}"); got != "off 1 None" {
+		t.Fatalf("options on the running server = %q", got)
+	}
+}
+
+func TestTextIncludesHistory(t *testing.T) {
+	m := isolated(t)
+	s, err := m.Spawn("h", []string{"sh", "-c", "seq 1 100; sleep 60"}, nil, 40, 10)
+	if err != nil {
+		t.Fatal(err)
+	}
+	eventually(t, "the output", func() bool {
+		txt, err := s.Text(1000)
+		f := strings.Fields(txt)
+		return err == nil && len(f) >= 100 && f[0] == "1" && f[99] == "100"
+	})
+}
+
+func TestWriteLeavesCopyModeAndKeepsLongMessagesWhole(t *testing.T) {
+	m := isolated(t)
+	out := filepath.Join(t.TempDir(), "heard.txt")
+	s, err := m.Spawn("w", []string{"sh", "-c", "stty raw -echo; cat > " + out}, nil, 80, 24)
+	if err != nil {
+		t.Fatal(err)
+	}
+	time.Sleep(500 * time.Millisecond)
+	if err := m.run("copy-mode", "-t", s.target()); err != nil {
+		t.Fatal(err)
+	}
+	// Past tmux's command length limit, and half of it multi-byte, which a naive split corrupts.
+	body := strings.Repeat("The quick brown fox jumps over the lazy dog. ", 250) +
+		strings.Repeat("这是一条很长的中文消息，用来确认分片不会把一个字劈成两半。", 250)
+	if err := s.Write([]byte(body)); err != nil {
+		t.Fatal(err)
+	}
+	eventually(t, "the whole message", func() bool {
+		got, _ := os.ReadFile(out)
+		return len(got) >= len(body)
+	})
+	if got, _ := os.ReadFile(out); string(got[:len(body)]) != body {
+		t.Fatal("the program received different bytes")
+	}
+	if mode := format(t, m, s.target(), "#{pane_in_mode}"); mode != "0" {
+		t.Fatalf("pane_in_mode = %s after Write", mode)
+	}
+}
+
 func TestChunkEnd(t *testing.T) {
-	han := []byte("中")            // 3 bytes
-	body := bytes.Repeat(han, 10) // 30 bytes
-	for max := 1; max <= len(body); max++ {
-		n := chunkEnd(body, max)
-		if max >= 3 && n%3 != 0 {
-			t.Errorf("chunkEnd(max=%d) = %d, which splits a rune", max, n)
-		}
-		if n > max {
-			t.Errorf("chunkEnd(max=%d) = %d, longer than asked", max, n)
-		}
-		if max >= 3 && n == 0 {
-			t.Errorf("chunkEnd(max=%d) made no progress", max)
+	body := bytes.Repeat([]byte("中"), 10)
+	for max := 3; max <= len(body); max++ {
+		if n := chunkEnd(body, max); n%3 != 0 || n > max || n == 0 {
+			t.Errorf("chunkEnd(max=%d) = %d", max, n)
 		}
 	}
-	// Short input is returned whole, and invalid UTF-8 still makes progress rather than stalling.
 	if got := chunkEnd([]byte("ab"), 8); got != 2 {
-		t.Errorf("chunkEnd of a short input = %d, want 2", got)
+		t.Errorf("short input: %d", got)
 	}
 	if got := chunkEnd([]byte{0x80, 0x80, 0x80, 0x80}, 2); got != 2 {
-		t.Errorf("chunkEnd of invalid UTF-8 = %d, want 2 (no stall)", got)
+		t.Errorf("invalid UTF-8: %d", got)
 	}
 }
 
-// A connector that cannot start is worse than a socket in a less private place.
-//
-// The runtime dir used to be under /tmp, which always worked. It is under $HOME now, and $HOME can
-// be unwritable, missing, or hidden from the process — systemd's ProtectHome does precisely that.
-// Returning an error there would take the whole connector down on machines that used to be fine.
-func TestNewManagerFallsBackWhenTheRuntimeDirCannotBeMade(t *testing.T) {
-	if _, err := findTmux(); err != nil {
-		t.Skip("no tmux available")
-	}
-	tmp := shortTempDir(t)
-	t.Setenv("TMPDIR", tmp)
-	t.Setenv("XDG_RUNTIME_DIR", "")
-
-	// A home that cannot be written into: a FILE where the directory would have to be.
-	home := filepath.Join(shortTempDir(t), "home")
-	if err := os.MkdirAll(filepath.Join(home, ".local"), 0o700); err != nil {
-		t.Fatal(err)
-	}
-	if err := os.WriteFile(filepath.Join(home, ".local", "state"), []byte("not a directory"), 0o600); err != nil {
-		t.Fatal(err)
-	}
-	t.Setenv("HOME", home)
-
-	m, err := NewManager()
-	if err != nil {
-		t.Fatalf("gave up instead of falling back: %v", err)
-	}
-	if !strings.HasPrefix(m.sock, tmp) {
-		t.Fatalf("fell back to %q, which is not the old location under %q", m.sock, tmp)
-	}
+// collector gathers a client's output.
+type collector struct {
+	mu  sync.Mutex
+	buf bytes.Buffer
 }
 
-// listenAt stands in for a tmux server an earlier build left running: something answering on
-// <dir>/t.sock.
-func listenAt(t *testing.T, dir string) string {
-	t.Helper()
-	if err := os.MkdirAll(dir, 0o700); err != nil {
-		t.Fatal(err)
-	}
-	sock := filepath.Join(dir, "t.sock")
-	ln, err := net.Listen("unix", sock)
+func (c *collector) add(b []byte) { c.mu.Lock(); c.buf.Write(b); c.mu.Unlock() }
+func (c *collector) String() string {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.buf.String()
+}
+func (c *collector) Len() int { c.mu.Lock(); defer c.mu.Unlock(); return c.buf.Len() }
+
+func TestEachClientIsPaintedWholeAtTheWindowSize(t *testing.T) {
+	m := isolated(t)
+	s, err := m.Spawn("a", []string{"sh", "-c", "echo hello-from-the-program; sleep 60"}, nil, 100, 30)
 	if err != nil {
 		t.Fatal(err)
 	}
-	t.Cleanup(func() { _ = ln.Close() })
-	return sock
+	time.Sleep(300 * time.Millisecond)
+	var first, second collector
+	c1, err := s.Attach(100, 30, Window, first.add, func(error) {})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer c1.Close()
+	eventually(t, "the first client's paint", func() bool { return strings.Contains(first.String(), "hello-from-the-program") })
+
+	if err := s.Resize(60, 20); err != nil {
+		t.Fatal(err)
+	}
+	if err := c1.Resize(60, 20); err != nil {
+		t.Fatal(err)
+	}
+	c2, err := s.Attach(60, 20, Window, second.add, func(error) {})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer c2.Close()
+	eventually(t, "the second client's paint", func() bool { return strings.Contains(second.String(), "hello-from-the-program") })
+	if got := format(t, m, s.target(), "#{window_width}x#{window_height}"); got != "60x20" {
+		t.Fatalf("window = %s, want 60x20 whatever the clients' sizes", got)
+	}
 }
 
-// The crossing: an update in place must come back to the socket the previous build is running.
-//
-// Old builds put it under the temp dir, and later under $XDG_RUNTIME_DIR when the process had one.
-// A new one that went straight to $HOME would start a SECOND tmux server and orphan everything the
-// first is hosting — every screen on the machine, still running, attached to a socket nobody looks
-// at again. This is the claim the release rests on, so it is asserted rather than commented.
-func TestAnUpdateKeepsUsingTheSocketTheOldBuildLeftRunning(t *testing.T) {
-	if _, err := findTmux(); err != nil {
-		t.Skip("no tmux available")
+func TestAClientThatIsNotAcknowledgedStopsBeingRead(t *testing.T) {
+	m := isolated(t)
+	s, err := m.Spawn("f", []string{"sh", "-c", "sleep 1; while true; do seq 1 1000; done"}, nil, 80, 24)
+	if err != nil {
+		t.Fatal(err)
 	}
+	var got collector
+	c, err := s.Attach(80, 24, Window, got.add, func(error) {})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer c.Close()
+	eventually(t, "the window to fill", func() bool { return got.Len() >= Window })
+	time.Sleep(time.Second)
+	if n := got.Len(); n > Window+32<<10 {
+		t.Fatalf("read %d bytes with nothing acknowledged; the limit is %d plus one read", n, Window)
+	}
+	before := got.Len()
+	c.Ack(before)
+	eventually(t, "reading to resume", func() bool { return got.Len() > before })
+}
+
+func TestAnEndedClientIsReported(t *testing.T) {
+	m := isolated(t)
+	s, err := m.Spawn("e", []string{"sleep", "60"}, nil, 80, 24)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ended := make(chan error, 1)
+	c, err := s.Attach(80, 24, Window, func([]byte) {}, func(err error) { ended <- err })
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer c.Close()
+	time.Sleep(300 * time.Millisecond)
+	if err := m.run("detach-client", "-s", "=e"); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case <-ended:
+	case <-time.After(5 * time.Second):
+		t.Fatal("a client that ended was not reported")
+	}
+}
+
+// An update in place must come back to the socket a server is still answering on, wherever an
+// older build put it; going elsewhere would orphan every screen it hosts.
+func TestAServerAtAnOlderLocationIsJoined(t *testing.T) {
+	needTmux(t)
 	for name, old := range map[string]func() string{
 		"temp dir":        brand.Current.LegacyRuntimePath,
 		"XDG runtime dir": brand.Current.XDGRuntimePath,
@@ -313,102 +279,66 @@ func TestAnUpdateKeepsUsingTheSocketTheOldBuildLeftRunning(t *testing.T) {
 			t.Setenv("TMPDIR", shortTempDir(t))
 			t.Setenv("XDG_RUNTIME_DIR", shortTempDir(t))
 			t.Setenv("HOME", shortTempDir(t))
-			want := listenAt(t, old())
-
+			if err := os.MkdirAll(old(), 0o700); err != nil {
+				t.Fatal(err)
+			}
+			want := filepath.Join(old(), "t.sock")
+			bin, _ := findTmux()
+			if out, err := exec.Command(bin, "-S", want, "new-session", "-d", "sleep 60").CombinedOutput(); err != nil {
+				t.Fatalf("%v: %s", err, out)
+			}
+			defer exec.Command(bin, "-S", want, "kill-server").Run()
 			m, err := NewManager()
 			if err != nil {
-				t.Fatalf("NewManager: %v", err)
+				t.Fatal(err)
 			}
 			if m.sock != want {
-				t.Fatalf("went to %q instead of %q — the sessions the old build is hosting are orphaned",
-					m.sock, want)
+				t.Fatalf("went to %q instead of %q", m.sock, want)
 			}
 		})
 	}
 }
 
-// The service and a person's shell must meet at one socket, and the shell must not leave anything
-// behind on the way. On a live machine the service (a systemd system unit, no $XDG_RUNTIME_DIR)
-// hosted its screens under $HOME while `status` in a login shell looked in /run/user/<uid>,
-// reported no screens, and created the directory there. Left over from that: the stray directory,
-// and possibly a socket file whose server is long gone. Neither may pull the shell away.
+// The service and a person's login shell meet at one socket, and a stray directory or a dead
+// socket file at an older location does not pull the shell away.
 func TestAShellFindsTheSocketTheServiceUses(t *testing.T) {
-	if _, err := findTmux(); err != nil {
-		t.Skip("no tmux available")
-	}
+	needTmux(t)
 	t.Setenv("TMPDIR", shortTempDir(t))
 	t.Setenv("HOME", shortTempDir(t))
 	t.Setenv("XDG_RUNTIME_DIR", "")
 	service, err := NewManager()
 	if err != nil {
-		t.Fatalf("NewManager as the service: %v", err)
+		t.Fatal(err)
 	}
-
-	run := shortTempDir(t)
-	t.Setenv("XDG_RUNTIME_DIR", run)
-	shell, err := NewManager()
-	if err != nil {
-		t.Fatalf("NewManager in a login shell: %v", err)
-	}
-	if shell.sock != service.sock {
-		t.Fatalf("a login shell looks at %q, the service hosts at %q", shell.sock, service.sock)
-	}
-	if _, err := os.Stat(brand.Current.XDGRuntimePath()); !os.IsNotExist(err) {
-		t.Fatalf("the shell left %s behind (stat: %v)", brand.Current.XDGRuntimePath(), err)
-	}
-
-	// What a dead server leaves in the old place: a t.sock nothing answers on. It is not followed.
+	t.Setenv("XDG_RUNTIME_DIR", shortTempDir(t))
 	if err := os.MkdirAll(brand.Current.XDGRuntimePath(), 0o700); err != nil {
 		t.Fatal(err)
 	}
 	if err := os.WriteFile(filepath.Join(brand.Current.XDGRuntimePath(), "t.sock"), nil, 0o600); err != nil {
 		t.Fatal(err)
 	}
-	again, err := NewManager()
+	shell, err := NewManager()
 	if err != nil {
-		t.Fatalf("NewManager beside a dead socket: %v", err)
+		t.Fatal(err)
 	}
-	if again.sock != service.sock {
-		t.Fatalf("followed the dead socket %q instead of the service's %q", again.sock, service.sock)
+	if shell.sock != service.sock {
+		t.Fatalf("a login shell looks at %q, the service hosts at %q", shell.sock, service.sock)
 	}
 }
 
-// And with nothing left behind, it uses the new home rather than the temp dir it came from.
-func TestAFreshMachineGetsTheNewPath(t *testing.T) {
-	if _, err := findTmux(); err != nil {
-		t.Skip("no tmux available")
-	}
+func TestARuntimeDirThatCannotBeMadeIsAnError(t *testing.T) {
+	needTmux(t)
 	t.Setenv("TMPDIR", shortTempDir(t))
-	home := shortTempDir(t)
 	t.Setenv("XDG_RUNTIME_DIR", "")
+	home := shortTempDir(t)
+	if err := os.MkdirAll(filepath.Join(home, ".local"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(home, ".local", "state"), nil, 0o600); err != nil {
+		t.Fatal(err)
+	}
 	t.Setenv("HOME", home)
-
-	m, err := NewManager()
-	if err != nil {
-		t.Fatalf("NewManager: %v", err)
+	if _, err := NewManager(); err == nil {
+		t.Fatal("NewManager succeeded with no usable runtime dir")
 	}
-	if !strings.HasPrefix(m.sock, home) {
-		t.Fatalf("a machine with nothing to inherit went to %q, not under %q", m.sock, home)
-	}
-}
-
-// TestDisabledFailsCleanlyRatherThanPanicking guards the actual reason Disabled exists: a caller
-// that gets one back must be able to call every Manager operation on it exactly like a real one —
-// getting a normal error back, never a nil-pointer panic — since the whole point is not needing a
-// nil check at every call site.
-func TestDisabledFailsCleanlyRatherThanPanicking(t *testing.T) {
-	m := Disabled()
-	if m == nil {
-		t.Fatal("Disabled() returned nil — callers would still need a nil check")
-	}
-	if m.HasSession("anything") {
-		t.Error("HasSession on a disabled manager reported true")
-	}
-	if n := m.LiveSessions(); n != 0 {
-		t.Errorf("LiveSessions on a disabled manager = %d, want 0", n)
-	}
-	if _, err := m.Spawn("s1", []string{"sh", "-c", "true"}, nil, 80, 24); err == nil {
-		t.Error("Spawn on a disabled manager succeeded — nothing is actually hosting it")
-	}
-	m.KillServer() // must not panic
 }

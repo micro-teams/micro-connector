@@ -1,17 +1,48 @@
-// Package service installs and controls this connector as a system service, under whatever init
-// system the machine uses (systemd, openrc, launchd), via kardianos/service.
+// Package service installs and controls a connector as a service of the machine's init system
+// (systemd, OpenRC, launchd, the Windows Service Manager) through kardianos/service. What the
+// service does is the product's: it supplies a Runner.
 //
-// What the service actually does is the product's — it supplies a Runner. This package only knows
-// how to install one, stop the one that is installed, and hand a cancellable context to whatever
-// was supplied. A product that never wants to be a service simply never calls it.
+// Variants. An unprivileged install is a per-user service (systemd --user, a launchd LaunchAgent);
+// a root install is a system service, which under sudo runs as the invoking user so the config and
+// the screens stay in that user's home. Windows has only system services. Acting on an existing
+// service uses the variant that is installed, whoever asks: an ordinary user stopping a service
+// that was installed with sudo acts on the system one.
+//
+// Screens outlive the service. The systemd unit uses KillMode=process, so stopping, restarting or
+// crashing the connector ends only the connector and never the tmux server it started; it restarts
+// 5 s after a crash, and a user unit starts with the user's session (default.target). tmux leaves
+// launchd's process group by itself.
+//
+//	Runner                       func(ctx) error: the work; runs until ctx is cancelled.
+//	New(cfgPath, run) (ksvc.Service, error)
+//	                             the service for this process's privilege; it launches
+//	                             `<binary> run --config <cfgPath>`. run may be nil to only control it.
+//	Control(cfgPath, action) error         install, uninstall, start, stop or restart, for this
+//	                                       process's privilege (what installing wants).
+//	ControlInstalled(cfgPath, action) error the same against the installed variant; ErrNotInstalled
+//	                                        when there is none.
+//	RunForeground(cfgPath, run) error      runs the work in this process, as the service manager does.
+//	Installed(cfgPath) (userService, found bool)
+//	Status(cfgPath) (string, error)        "running", "stopped", "not installed" or "unknown".
+//	UnitCurrent(cfgPath) (bool, error)     whether an installed systemd unit is the one this build
+//	                                       writes; false means reinstalling it is needed for screens
+//	                                       to survive a stop. Always true off systemd.
+//
+// Example:
+//
+//	if err := service.Control(cfgPath, "install"); err != nil { ... }
+//	if err := service.ControlInstalled(cfgPath, "restart"); err != nil { ... }
 package service
 
 import (
 	"context"
 	"errors"
+	"fmt"
 	"log"
 	"os"
+	"path/filepath"
 	"runtime"
+	"strings"
 	"time"
 
 	ksvc "github.com/kardianos/service"
@@ -19,9 +50,9 @@ import (
 	"github.com/micro-teams/micro-connector/cli/brand"
 )
 
-// Runner is the work the service performs: it runs until ctx is cancelled, and returning early is
-// how it reports that it could not continue.
 type Runner func(ctx context.Context) error
+
+var ErrNotInstalled = errors.New("no connector service is installed on this machine")
 
 type program struct {
 	run    Runner
@@ -42,81 +73,71 @@ func (p *program) Start(_ ksvc.Service) error {
 	return nil
 }
 
+// stopWait bounds how long a stop waits for the work to wind down before the process exits anyway.
+const stopWait = 6 * time.Second
+
 func (p *program) Stop(_ ksvc.Service) error {
-	if p.cancel != nil {
-		p.cancel()
+	if p.cancel == nil {
+		return nil
 	}
-	if p.done != nil {
-		select {
-		case <-p.done:
-		case <-time.After(6 * time.Second):
-		}
+	p.cancel()
+	select {
+	case <-p.done:
+		return nil
+	case <-time.After(stopWait):
+		return fmt.Errorf("%s: the service did not stop within %s", brand.Current.Name, stopWait)
 	}
-	return nil
 }
 
-// New builds the service bound to the config at cfgPath. When the service manager launches the
-// binary it runs `<binary> run --config <cfgPath>`.
-//
-// kardianos adapts to the init system but not to privilege: by default it installs a system-level
-// unit, which needs root (and, under systemd, a polkit agent to prompt for it). That is adapted
-// here — an unprivileged user installs a per-user service instead (systemd `--user`, launchd
-// LaunchAgent), needing neither. A machine's config already lives in the user's home, so per-user
-// is the natural default for an unprivileged install.
-//
-// Windows has no equivalent of a per-user service: kardianos's windows backend never reads the
-// "UserService" option (see its service_windows.go) and always registers with the Windows Service
-// Manager, which is inherently a system-level, admin-only mechanism. os.Geteuid() is also always -1
-// there (Windows has no euid), so it cannot stand in for "am I privileged" the way it does on
-// Unix. Installing on Windows therefore always takes the system-unit branch below and always needs
-// an elevated (Run as administrator) process — there is no unprivileged install to fall back to.
-//
-// run may be nil for callers that only mean to install, stop or uninstall: those never start the
-// work, and the service manager launches a fresh process when it needs to.
 func New(cfgPath string, run Runner) (ksvc.Service, error) {
-	// Default to a per-user service when unprivileged, a system service when root — except on
-	// Windows, where "per-user" is not a thing kardianos or the OS's service manager offers.
-	userService := runtime.GOOS != "windows" && os.Geteuid() != 0
-	return newService(cfgPath, userService, run)
+	return newService(cfgPath, runtime.GOOS != "windows" && os.Geteuid() != 0, run)
 }
 
-// newService builds the service as either a per-user or a system unit.
-//
-// The unit's name comes from the brand, and that matters more than it looks: uninstalling by the
-// wrong name stops nothing while reporting success, which this project has already shipped once.
+// unit is the systemd unit for a variant.
+func unit(userService bool) string {
+	wantedBy := "multi-user.target"
+	if userService {
+		wantedBy = "default.target"
+	}
+	return `[Unit]
+Description={{Description}}
+ConditionFileIsExecutable={{Path | cmdEscape}}
+{{range Dependencies}}{{.}}
+{{end}}
+[Service]
+StartLimitInterval=5
+StartLimitBurst=10
+ExecStart={{Path | cmdEscape}}{{range Arguments}} {{. | cmd}}{{end}}
+{{if UserName}}User={{UserName}}
+{{end}}{{if Restart}}Restart={{Restart}}
+{{end}}RestartSec=5
+KillMode=process
+EnvironmentFile=-/etc/sysconfig/{{Name}}
+
+{{range EnvVars}}{{.}}
+{{end}}[Install]
+WantedBy=` + wantedBy + "\n"
+}
+
 func newService(cfgPath string, userService bool, run Runner) (ksvc.Service, error) {
 	cfg := &ksvc.Config{
 		Name:        brand.Current.ServiceName,
 		DisplayName: brand.Current.ServiceDisplayName,
 		Description: brand.Current.ServiceDescription,
 		Arguments:   []string{"run", "--config", cfgPath},
+		Option:      ksvc.KeyValue{"SystemdScript": unit(userService)},
 	}
 	switch {
 	case userService:
-		// A per-user service (systemd --user / launchd LaunchAgent): no root or polkit. Never
-		// reached on Windows — see New()'s doc comment.
-		cfg.Option = ksvc.KeyValue{"UserService": true}
+		cfg.Option["UserService"] = true
 	case runtime.GOOS != "windows":
 		if u := os.Getenv("SUDO_USER"); u != "" && u != "root" {
-			// A *system* unit that starts at boot with nobody logged in — but run it AS the
-			// invoking user so it uses that user's home (config + private tmux) and gets a
-			// real $HOME (restish and tmux both need one; systemd/launchd populate HOME from
-			// the account database when User is set). SUDO_USER is a sudo-ism; Windows'
-			// elevation (a UAC-elevated process) carries no equivalent env var, and the Windows
-			// Service Manager runs LocalSystem by default regardless, so there is nothing to
-			// set here for that platform.
 			cfg.UserName = u
 		}
 	}
 	return ksvc.New(&program{run: run}, cfg)
 }
 
-// Control runs an install/uninstall/start/stop/restart action against the service, choosing the
-// variant from our own privilege — which is what INSTALLING wants: root installs a system service,
-// an unprivileged user a per-user one.
-//
-// For acting on a service that already exists, use ControlInstalled: the variant is then a fact
-// about the machine, not about who is asking.
 func Control(cfgPath, action string) error {
 	s, err := New(cfgPath, nil)
 	if err != nil {
@@ -125,9 +146,6 @@ func Control(cfgPath, action string) error {
 	return ksvc.Control(s, action)
 }
 
-// ControlInstalled runs an action against the variant that is actually installed. Returns
-// ErrNotInstalled when neither variant exists, so a caller can say "nothing to stop" rather than
-// reporting whatever error the wrong variant's manager happened to produce.
 func ControlInstalled(cfgPath, action string) error {
 	userService, found := Installed(cfgPath)
 	if !found {
@@ -140,10 +158,6 @@ func ControlInstalled(cfgPath, action string) error {
 	return ksvc.Control(s, action)
 }
 
-// ErrNotInstalled means no connector service exists on this machine, under either variant.
-var ErrNotInstalled = errors.New("no connector service is installed on this machine")
-
-// RunForeground runs the work in the current process, the way `<binary> run` does.
 func RunForeground(cfgPath string, run Runner) error {
 	s, err := New(cfgPath, run)
 	if err != nil {
@@ -152,18 +166,8 @@ func RunForeground(cfgPath string, run Runner) error {
 	return s.Run()
 }
 
-// resolveVariant picks the privilege variant to act on: the one that is actually INSTALLED,
-// preferring the one matching our own euid when both answer.
-//
-// This exists because looking and acting used to disagree. Status has always probed both variants
-// (so a normal user still sees a system service installed via sudo), while Control built its
-// service from euid alone — so `link disconnect`, run as an ordinary user on a machine whose
-// connector was installed with sudo, went looking for a *user* unit that had never existed, left
-// the running system service untouched, and reported either "not installed" or, on a machine with
-// no user session bus, a baffling D-Bus error. The machine stayed connected and `status` agreed it
-// was connected, because status was looking at the other variant.
-//
-// probe is injected so the decision is testable without a service manager.
+// resolveVariant picks the installed variant, preferring preferUser when both are installed.
+// probe(v) is nil when variant v is installed.
 func resolveVariant(preferUser bool, probe func(userService bool) error) (userService, found bool) {
 	for _, v := range []bool{preferUser, !preferUser} {
 		if probe(v) == nil {
@@ -173,29 +177,17 @@ func resolveVariant(preferUser bool, probe func(userService bool) error) (userSe
 	return preferUser, false
 }
 
-// probeInstalled reports whether this variant exists on the machine (nil = it does).
-func probeInstalled(cfgPath string) func(bool) error {
-	return func(userService bool) error {
+func Installed(cfgPath string) (userService, found bool) {
+	return resolveVariant(os.Geteuid() != 0, func(userService bool) error {
 		s, err := newService(cfgPath, userService, nil)
 		if err != nil {
 			return err
 		}
-		_, err = s.Status() // ErrNotInstalled (or a manager error) means "not this one"
+		_, err = s.Status()
 		return err
-	}
+	})
 }
 
-// Installed reports which variant is installed, and whether either is. Callers that need root for
-// a system unit ask this first (see the CLI's disconnect/logout).
-func Installed(cfgPath string) (userService, found bool) {
-	return resolveVariant(os.Geteuid() != 0, probeInstalled(cfgPath))
-}
-
-// Status returns a human-readable service status string. It looks for the service under
-// both privilege variants — the one matching our own euid first, then the other — so a
-// normal-user `microteams status` still reports a *system* service installed via sudo (and
-// vice versa). Querying a system unit's state needs no root. "not installed" means
-// neither variant exists.
 func Status(cfgPath string) (string, error) {
 	userService, found := Installed(cfgPath)
 	if !found {
@@ -203,16 +195,45 @@ func Status(cfgPath string) (string, error) {
 	}
 	s, err := newService(cfgPath, userService, nil)
 	if err != nil {
-		return "unknown", nil
+		return "", err
 	}
-	switch st, err := s.Status(); {
-	case err != nil:
-		return "unknown", nil
-	case st == ksvc.StatusRunning:
+	st, err := s.Status()
+	if err != nil {
+		return "", err
+	}
+	switch st {
+	case ksvc.StatusRunning:
 		return "running", nil
-	case st == ksvc.StatusStopped:
+	case ksvc.StatusStopped:
 		return "stopped", nil
 	default:
 		return "unknown", nil
 	}
+}
+
+func UnitCurrent(cfgPath string) (bool, error) {
+	userService, found := Installed(cfgPath)
+	if !found {
+		return false, ErrNotInstalled
+	}
+	s, err := newService(cfgPath, userService, nil)
+	if err != nil {
+		return false, err
+	}
+	if !strings.HasPrefix(s.Platform(), "linux-systemd") {
+		return true, nil
+	}
+	path := filepath.Join("/etc/systemd/system", brand.Current.ServiceName+".service")
+	if userService {
+		dir, err := os.UserConfigDir()
+		if err != nil {
+			return false, err
+		}
+		path = filepath.Join(dir, "systemd", "user", brand.Current.ServiceName+".service")
+	}
+	b, err := os.ReadFile(path)
+	if err != nil {
+		return false, err
+	}
+	return strings.Contains(string(b), "\nKillMode=process\n"), nil
 }

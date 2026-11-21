@@ -1,18 +1,14 @@
-// The seam under the credential.
-//
-// What these pin is an ordering, not a feature: whatever a product puts underneath this transport
-// receives a request that is already authenticated, and is free to change where that request goes.
-// Get it the other way round — decide the credential after something has rewritten the host — and
-// the credential is silently dropped, because this injector attaches it by comparing the host
-// against the API it was configured for. A test is worth it precisely because that failure looks
-// like an auth bug rather than a layering one.
-
+// Tests for the authenticating transport: the transport underneath receives a request that already
+// carries the credential (so one that rewrites the host cannot lose it), a foreign host gets no
+// credential, and missing configuration or a failed exchange is an error.
 package apiauth
 
 import (
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
+	"strings"
 	"testing"
 )
 
@@ -21,6 +17,7 @@ import (
 type recorder struct {
 	seen    *http.Request
 	rewrite string // non-empty: send it somewhere else, as a line-selecting transport would
+	status  int    // the answer; 200 when zero
 }
 
 func (r *recorder) RoundTrip(req *http.Request) (*http.Response, error) {
@@ -34,8 +31,13 @@ func (r *recorder) RoundTrip(req *http.Request) (*http.Response, error) {
 		clone.URL = u
 		req = clone
 	}
+	status := r.status
+	if status == 0 {
+		status = http.StatusOK
+	}
 	return &http.Response{
-		StatusCode: http.StatusOK,
+		Status:     fmt.Sprintf("%d %s", status, http.StatusText(status)),
+		StatusCode: status,
 		Body:       http.NoBody,
 		Header:     http.Header{},
 		Request:    req,
@@ -47,7 +49,7 @@ func TestTheBaseTransportSeesAnAuthenticatedRequest(t *testing.T) {
 	t.Setenv("CONNECTOR_TOKEN", "machine-token")
 
 	base := &recorder{}
-	client := ClientOver(base)
+	client := mustClient(t, base)
 
 	if _, err := client.Get("https://control.example/chat"); err != nil {
 		t.Fatalf("unexpected error: %v", err)
@@ -72,7 +74,7 @@ func TestABaseThatRewritesTheHostStillCarriesTheCredential(t *testing.T) {
 	t.Setenv("CONNECTOR_TOKEN", "machine-token")
 
 	base := &recorder{rewrite: server.URL}
-	if _, err := ClientOver(base).Get("https://control.example/chat"); err != nil {
+	if _, err := mustClient(t, base).Get("https://control.example/chat"); err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
 	if got := base.seen.Header.Get("Authorization"); got != "Bearer machine-token" {
@@ -80,15 +82,34 @@ func TestABaseThatRewritesTheHostStillCarriesTheCredential(t *testing.T) {
 	}
 }
 
-// And the default stays the default: no argument means the standard transport, which is what every
-// existing caller gets.
-func TestTransportWithoutABaseIsStillATransport(t *testing.T) {
-	t.Setenv("CONNECTOR_API", "https://control.example")
-	if Transport() == nil {
-		t.Fatal("Transport() returned nil")
+func mustClient(t *testing.T, base http.RoundTripper) *http.Client {
+	t.Helper()
+	c, err := ClientOver(base)
+	if err != nil {
+		t.Fatal(err)
 	}
-	if TransportOver(nil) == nil {
-		t.Fatal("TransportOver(nil) returned nil")
+	return c
+}
+
+func TestNoBaseAnywhereIsAnError(t *testing.T) {
+	t.Setenv("CONNECTOR_API", "")
+	t.Setenv("HOME", t.TempDir())
+	t.Setenv("XDG_CONFIG_HOME", "")
+	if _, err := Transport(); err == nil {
+		t.Fatal("a transport with no control plane configured")
+	}
+}
+
+func TestAFailedExchangeFailsTheRequest(t *testing.T) {
+	t.Setenv("CONNECTOR_API", "https://control.example")
+	t.Setenv("CONNECTOR_TOKEN", "machine-token")
+	t.Setenv("CONNECTOR_SCREEN", "screen-token")
+	ScreenExchange = &ScreenTokenExchange{Path: "/token", SessionHeader: "X-S", ScreenHeader: "X-Sc"}
+	defer func() { ScreenExchange = nil }()
+	base := &recorder{status: http.StatusForbidden}
+	_, err := mustClient(t, base).Get("https://control.example/chat")
+	if err == nil || !strings.Contains(err.Error(), "403") {
+		t.Fatalf("err = %v, want the exchange's 403", err)
 	}
 }
 
@@ -99,7 +120,7 @@ func TestAForeignHostGetsNoCredential(t *testing.T) {
 	t.Setenv("CONNECTOR_TOKEN", "machine-token")
 
 	base := &recorder{}
-	if _, err := ClientOver(base).Get("https://somewhere.else/thing"); err != nil {
+	if _, err := mustClient(t, base).Get("https://somewhere.else/thing"); err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
 	if got := base.seen.Header.Get("Authorization"); got != "" {

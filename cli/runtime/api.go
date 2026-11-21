@@ -1,156 +1,105 @@
+// The applet's view of the runtime: one global object, `connector`.
+//
+//	connector.term.read(): string           the visible screen
+//	connector.term.write(data): boolean     types data; false when refused (a person holds the
+//	                                        input lease) or failed (logged)
+//	connector.term.hold(on): boolean        takes (true) or releases (false) the input lease; false
+//	                                        when a person holds it
+//	connector.term.onChange(fn)             fn() on every screen change and every ~1.2 s
+//	connector.own(name, initial)            {get(), set(v)}: a variable the control plane mirrors
+//	connector.watch(name)                   {get(), onChange(fn)}: a control-plane variable
+//	connector.expose(name, fn)              fn may be called by the control plane; its return value
+//	                                        is the answer
+//	connector.call(name, ...args): Promise  calls the control plane
+//	connector.log(message)                  writes to the connector's log
+//
+// Example:
+//
+//	const status = connector.own('status', 'starting')
+//	connector.term.onChange(() => status.set(/\$ $/.test(connector.term.read()) ? 'idle' : 'busy'))
+//	connector.expose('say', (text) => connector.term.write(text + '\r'))
 package runtime
 
 import (
-	"github.com/micro-teams/micro-connector/cli/brand"
-	"log"
+	"errors"
+	"fmt"
+	"os"
 	"reflect"
 	"strconv"
 
 	"github.com/dop251/goja"
+
+	"github.com/micro-teams/micro-connector/cli/brand"
 )
 
-// installAPI builds the single global the hosted script sees. It is
-// deliberately tiny — a terminal, two flavors of variable, two directions of
-// function — and carries no notion of what any of it means.
-func (r *Runtime) installAPI() error {
+func (r *Runtime) logf(format string, a ...any) {
+	fmt.Fprintf(os.Stderr, "%s: applet: %s\n", brand.Current.Name, fmt.Sprintf(format, a...))
+}
+
+func (r *Runtime) installAPI() {
 	vm := r.vm
-
-	// __log: default logger the runtime uses; scripts reach it as <global>.log.
-	_ = vm.Set("__log", func(msg string) { log.Printf("script: %s", msg) })
-
-	api := vm.NewObject()
-
-	// --- terminal (read/write) --------------------------------------------
-	term := vm.NewObject()
-	_ = term.Set("read", func(goja.FunctionCall) goja.Value {
-		return vm.ToValue(r.term.Snapshot())
-	})
-	_ = term.Set("write", func(call goja.FunctionCall) goja.Value {
-		if len(call.Arguments) == 0 {
-			return goja.Undefined()
+	set := func(o *goja.Object, name string, v any) {
+		if err := o.Set(name, v); err != nil {
+			panic(err) // only fails for a frozen object, which these are not
 		}
-		if err := r.term.Write(toBytes(call.Arguments[0])); err != nil {
+	}
+
+	term := vm.NewObject()
+	set(term, "read", func() string { return r.term.Snapshot() })
+	set(term, "write", func(data string) bool {
+		err := r.term.Write([]byte(data))
+		if err != nil && !errors.Is(err, ErrHeld) {
 			r.logf("term.write: %v", err)
 		}
-		return goja.Undefined()
+		return err == nil
 	})
-	_ = term.Set("onChange", func(call goja.FunctionCall) goja.Value {
-		if len(call.Arguments) > 0 {
-			_ = vm.Set(terminalChangeFn, call.Arguments[0])
+	set(term, "hold", func(on bool) bool {
+		err := r.term.Hold(on)
+		if err != nil && !errors.Is(err, ErrHeld) {
+			r.logf("term.hold: %v", err)
 		}
-		return goja.Undefined()
+		return err == nil
 	})
-	_ = api.Set("term", term)
+	set(term, "onChange", func(fn goja.Callable) { r.onChange = fn })
 
-	// --- own: script-owned variable (script r/w, server mirrors) ----------
-	_ = api.Set("own", func(call goja.FunctionCall) goja.Value {
-		name := call.Argument(0).String()
-		initial := exportArg(call, 1)
-		r.owned[name] = initial
-		r.bus.PushVar(name, initial) // seed the server's mirror
-
-		handle := vm.NewObject()
-		_ = handle.Set("get", func(goja.FunctionCall) goja.Value {
-			return vm.ToValue(r.owned[name])
-		})
-		_ = handle.Set("set", func(c goja.FunctionCall) goja.Value {
-			v := exportArg(c, 0)
-			if !equal(r.owned[name], v) {
-				r.owned[name] = v
-				r.bus.PushVar(name, v)
+	api := vm.NewObject()
+	set(api, "term", term)
+	set(api, "own", func(name string, initial goja.Value) *goja.Object {
+		r.owned[name] = initial.Export()
+		r.bus.PushVar(name, r.owned[name])
+		h := vm.NewObject()
+		set(h, "get", func() any { return r.owned[name] })
+		set(h, "set", func(v goja.Value) {
+			x := v.Export()
+			if !reflect.DeepEqual(r.owned[name], x) {
+				r.owned[name] = x
+				r.bus.PushVar(name, x)
 			}
-			return goja.Undefined()
 		})
-		return handle
+		return h
 	})
-
-	// --- watch: server-owned variable (server r/w, script observes) -------
-	_ = api.Set("watch", func(call goja.FunctionCall) goja.Value {
-		name := call.Argument(0).String()
-		if _, ok := r.watched[name]; !ok {
-			r.watched[name] = &watchedVar{}
-		}
-		handle := vm.NewObject()
-		_ = handle.Set("get", func(goja.FunctionCall) goja.Value {
-			return vm.ToValue(r.watched[name].value)
-		})
-		_ = handle.Set("onChange", func(c goja.FunctionCall) goja.Value {
-			if fn, ok := goja.AssertFunction(c.Argument(0)); ok {
-				r.watched[name].listeners = append(r.watched[name].listeners, fn)
-			}
-			return goja.Undefined()
-		})
-		return handle
+	set(api, "watch", func(name string) *goja.Object {
+		w := r.watch(name)
+		h := vm.NewObject()
+		set(h, "get", func() any { return w.value })
+		set(h, "onChange", func(fn goja.Callable) { w.listeners = append(w.listeners, fn) })
+		return h
 	})
-
-	// --- expose: a script function the server may call --------------------
-	_ = api.Set("expose", func(call goja.FunctionCall) goja.Value {
-		name := call.Argument(0).String()
-		if fn, ok := goja.AssertFunction(call.Argument(1)); ok {
-			r.exposed[name] = fn
-		}
-		return goja.Undefined()
-	})
-
-	// --- call: invoke a server function, returns a Promise ----------------
-	_ = api.Set("call", func(call goja.FunctionCall) goja.Value {
-		name := call.Argument(0).String()
-		args := make([]any, 0, len(call.Arguments)-1)
-		for _, a := range call.Arguments[1:] {
-			args = append(args, a.Export())
+	set(api, "expose", func(name string, fn goja.Callable) { r.exposed[name] = fn })
+	set(api, "call", func(call goja.FunctionCall) goja.Value {
+		args := []any{}
+		for i := 1; i < len(call.Arguments); i++ {
+			args = append(args, call.Arguments[i].Export())
 		}
 		p, resolve, reject := vm.NewPromise()
 		r.callSeq++
 		id := strconv.Itoa(r.callSeq)
 		r.pending[id] = &pendingCall{resolve: resolve, reject: reject}
-		r.bus.CallServer(id, name, args)
+		r.bus.CallServer(id, call.Argument(0).String(), args)
 		return vm.ToValue(p)
 	})
-
-	_ = api.Set("log", func(msg string) { log.Printf("script: %s", msg) })
-
-	// The applet reaches the host through one global. Its canonical name is neutral, because the
-	// same built applet has to run under every product that embeds this connector; the brand's own
-	// name is installed as an alias so applets written against a specific product keep working.
+	set(api, "log", func(msg string) { r.logf("%s", msg) })
 	if err := vm.Set("connector", api); err != nil {
-		return err
+		panic(err)
 	}
-	if n := brand.Current.Name; n != "" && n != "connector" {
-		if err := vm.Set(n, api); err != nil {
-			return err
-		}
-	}
-	return nil
-}
-
-// toBytes accepts a JS string or array-like and returns raw bytes for the pty.
-func toBytes(v goja.Value) []byte {
-	switch x := v.Export().(type) {
-	case string:
-		return []byte(x)
-	case []byte:
-		return x
-	case []any:
-		b := make([]byte, len(x))
-		for i, e := range x {
-			if n, ok := e.(int64); ok {
-				b[i] = byte(n)
-			}
-		}
-		return b
-	default:
-		return []byte(v.String())
-	}
-}
-
-func exportArg(call goja.FunctionCall, i int) any {
-	if i >= len(call.Arguments) {
-		return nil
-	}
-	return call.Arguments[i].Export()
-}
-
-// equal is a cheap value comparison to suppress no-op variable pushes.
-func equal(a, b any) bool {
-	return reflect.DeepEqual(a, b)
 }

@@ -1,14 +1,36 @@
-// Package ws carries the protocol over a resident WebSocket: one connection, dialled out, kept up
-// for as long as the machine is.
+// Package ws carries the protocol over a resident WebSocket that the machine dials out to the control
+// plane, so nothing listens on the machine and it works behind NAT. It reconnects with backoff
+// (1 s doubling to 5 s) whenever the connection drops, pings every 15 s and treats 45 s without any
+// inbound frame as a dead connection, and announces the protocol version (`hello`) on each
+// connection. It knows nothing about what the messages mean.
 //
-// This is the transport for a product whose screens are long-lived and whose control plane must be
-// able to reach them at any moment — a message can arrive at any time, so somebody has to be
-// listening. The peer of transport/httppoll, which suits the opposite shape: one command, one
-// screen, no daemon.
+// The handshake carries the machine's token in X-<Brand>-Session and the base URL it reached the
+// control plane on in X-<Brand>-Origin (<Brand> is brand.Current.Name with a capital initial); the
+// control plane echoes the origin to the screens it opens, so a screen never guesses its control
+// plane's address.
 //
-// It always dials out, so it works from behind NAT with nothing listening on the machine, and it
-// reconnects with capped backoff and heartbeats while up. It knows nothing about what the messages
-// mean.
+//	New(url, token, origin) *Conn
+//	NewWithOptions(url, token, origin, Options) *Conn
+//	Options.ChooseURL func() string     the URL for the next attempt (nil: url every time).
+//	Options.Report func(url, held, err) how each attempt went; held is how long the connection
+//	                                    lasted (0 when the dial failed), since a route that accepts
+//	                                    the handshake and drops at once must not count as working.
+//	Options.NetDial                     opens the connection an attempt runs over (TLS, when the URL
+//	                                    asks for it, goes on top), e.g. a stream through a local
+//	                                    multipath client, so a path failing underneath is not a
+//	                                    disconnection at all.
+//	(*Conn).Run(ctx, onMsg) error       dials and delivers inbound messages until ctx ends.
+//	(*Conn).Send(msg) error             safe from any goroutine; fails while disconnected and when a
+//	                                    write does not complete within 10 s (the connection is then
+//	                                    closed and redialled).
+//	(*Conn).Reconnect()                 drops the connection so the next attempt chooses a route
+//	                                    afresh; the process and its screens keep running.
+//
+// Example:
+//
+//	conn := ws.New("wss://example.com/machine/link", token, "https://example.com")
+//	go conn.Run(ctx, mgr.Dispatch)
+//	conn.Send(protocol.Msg{T: "var.push", Sid: "s1", Name: "status", Value: "idle"})
 package ws
 
 import (
@@ -18,64 +40,35 @@ import (
 	"fmt"
 	"net"
 	"net/http"
+	"os"
+	"strings"
 	"sync"
 	"time"
 
 	"github.com/gorilla/websocket"
 
+	"github.com/micro-teams/micro-connector/cli/brand"
 	"github.com/micro-teams/micro-connector/cli/protocol"
 )
 
-// Ping cadence and liveness window. We ping every pingPeriod; the peer's pong
-// (or any message) resets a pongWait read deadline. If nothing arrives within
-// pongWait — e.g. a half-open connection where the server died but TCP never
-// closed — ReadMessage fails and the Run loop reconnects. pingPeriod must be
-// comfortably under pongWait.
 const (
 	pingPeriod = 15 * time.Second
 	pongWait   = 45 * time.Second
+	writeWait  = 10 * time.Second
 )
 
 var _ protocol.Transport = (*Conn)(nil)
 
-// Options lets a product decide where each attempt goes, and learn how it went.
-//
-// The library keeps the reconnect loop — backoff, heartbeats, the meaning of a drop — because that
-// is about the protocol. Which of several public routes to dial is not: it is a fact about a
-// deployment, and a product that has more than one route needs to choose per attempt and to know
-// which attempts held, so it can stop choosing a route that accepts the handshake and then drops
-// it. Left zero, this behaves exactly as it always did.
 type Options struct {
-	// ChooseURL supplies the URL for the next attempt. nil means the URL given to New, every time.
 	ChooseURL func() string
-	// Report is told how an attempt went: the URL dialled, how long the connection was held (zero
-	// if the dial itself failed), and the error if there was one.
-	//
-	// "How long it was held" rather than "did it connect", because those differ in the case that
-	// matters: a route that completes the handshake and severs the connection a second later looks
-	// like a success on every attempt, and a client that believed it would reconnect to it forever.
-	Report func(url string, held time.Duration, err error)
-	// NetDial supplies the connection each attempt is made over, instead of the library opening a
-	// TCP connection to the URL's host itself. The handshake and every frame afterwards are written
-	// to whatever it returns; TLS, if the URL asks for it, is negotiated on top.
-	//
-	// This exists because a route is not always a socket. A machine may already hold a transport to
-	// the control plane — several network paths aggregated into one stream, say — and the right
-	// thing is then to carry this connection INSIDE it rather than beside it: a path failing
-	// underneath stops being a disconnection at all, because the stream survives it and this
-	// WebSocket never learns a link changed. The alternative, dialling out separately, means the
-	// control link drops and reconnects every time one route dies, which for a machine is the
-	// difference between briefly offline and never offline.
-	//
-	// nil means the library dials, exactly as it always did.
-	NetDial func(ctx context.Context, network, address string) (net.Conn, error)
+	Report    func(url string, held time.Duration, err error)
+	NetDial   func(ctx context.Context, network, address string) (net.Conn, error)
 }
 
-// Conn maintains the dial-out websocket to the control plane.
 type Conn struct {
 	url    string
 	token  string
-	origin string // the API base we dialed, reported so the server can echo it to our screens
+	origin string
 	opts   Options
 
 	mu      sync.Mutex
@@ -83,32 +76,14 @@ type Conn struct {
 	writeMu sync.Mutex
 }
 
-// New builds a Conn dialling url, authenticating with token. origin is the API base this machine
-// reached the control plane on (which endpoint it chose); the control plane echoes it back to the
-// screens it opens here, so a screen never has to assume its own control plane's address.
 func New(url, token, origin string) *Conn {
 	return NewWithOptions(url, token, origin, Options{})
 }
 
-// NewWithOptions is New with a product's own choice of route per attempt. See Options.
-//
-// origin stays what the caller passed regardless of which URL an attempt uses: it is the canonical
-// address a screen should reach its control plane on, not a record of which route this process
-// happens to be dialling at the moment.
 func NewWithOptions(url, token, origin string, opts Options) *Conn {
 	return &Conn{url: url, token: token, origin: origin, opts: opts}
 }
 
-// Reconnect drops the current connection so the loop dials again, choosing where to go afresh.
-//
-// It exists because the choice of route is made per attempt, which means a connection that is
-// working stays where it is — correctly, since dropping a healthy link every time a ranking wobbles
-// would be worse than the wobble. But when the set of routes changes, or an operator wants to force
-// the question, there has to be a way to ask for a new attempt without stopping the process. That
-// distinction is not cosmetic here: stopping this process is what kills the screens it hosts, so
-// "reconnect" and "restart" must not be the same button.
-//
-// Safe to call when nothing is connected: the loop is already dialling.
 func (c *Conn) Reconnect() {
 	c.mu.Lock()
 	conn := c.conn
@@ -118,13 +93,8 @@ func (c *Conn) Reconnect() {
 	}
 }
 
-// Run dials and pumps messages to onMsg until ctx is cancelled, reconnecting
-// with capped backoff on any drop.
 func (c *Conn) Run(ctx context.Context, onMsg func(protocol.Msg)) error {
 	backoff := time.Second
-	// Keep the cap low so a machine comes back quickly after a server restart —
-	// screens survive the drop locally, so we want to reattach within seconds,
-	// not tens of seconds.
 	const maxBackoff = 5 * time.Second
 	for {
 		if ctx.Err() != nil {
@@ -163,11 +133,7 @@ func (c *Conn) Run(ctx context.Context, onMsg func(protocol.Msg)) error {
 	}
 }
 
-// dialer is the gorilla dialer for one attempt: the package default unless the product supplied a
-// way to open the connection itself.
-//
-// The default is returned as a VALUE copy rather than the shared DefaultDialer pointer, so that a
-// caller with NetDial set can never mutate the dialer every other user of this package shares.
+// dialer copies the default dialer when NetDial is set, so the shared default is never changed.
 func (c *Conn) dialer() *websocket.Dialer {
 	if c.opts.NetDial == nil {
 		return websocket.DefaultDialer
@@ -183,11 +149,12 @@ func (c *Conn) runOnce(
 	onMsg func(protocol.Msg),
 ) (connected bool, err error) {
 	header := http.Header{}
+	prefix := "X-" + strings.ToUpper(brand.Current.Name[:1]) + brand.Current.Name[1:]
 	if c.token != "" {
-		header.Set("X-Microteams-Session", c.token)
+		header.Set(prefix+"-Session", c.token)
 	}
 	if c.origin != "" {
-		header.Set("X-Microteams-Origin", c.origin)
+		header.Set(prefix+"-Origin", c.origin)
 	}
 	conn, _, err := c.dialer().DialContext(ctx, url, header)
 	if err != nil {
@@ -206,10 +173,12 @@ func (c *Conn) runOnce(
 		c.mu.Unlock()
 	}()
 
-	_ = c.Send(protocol.Msg{T: "hello", V: protocol.Version})
-
-	// Liveness: reset the read deadline on every pong (and every message below).
-	_ = conn.SetReadDeadline(time.Now().Add(pongWait))
+	if err := c.Send(protocol.Msg{T: "hello", V: protocol.Version}); err != nil {
+		return true, err
+	}
+	if err := conn.SetReadDeadline(time.Now().Add(pongWait)); err != nil {
+		return true, err
+	}
 	conn.SetPongHandler(func(string) error {
 		return conn.SetReadDeadline(time.Now().Add(pongWait))
 	})
@@ -223,18 +192,18 @@ func (c *Conn) runOnce(
 		if err != nil {
 			return true, err
 		}
-		_ = conn.SetReadDeadline(time.Now().Add(pongWait))
-		var m protocol.Msg
-		if json.Unmarshal(data, &m) == nil {
-			onMsg(m)
+		if err := conn.SetReadDeadline(time.Now().Add(pongWait)); err != nil {
+			return true, err
 		}
+		var m protocol.Msg
+		if err := json.Unmarshal(data, &m); err != nil {
+			fmt.Fprintf(os.Stderr, "%s: unreadable message from the control plane: %v\n", brand.Current.Name, err)
+			continue
+		}
+		onMsg(m)
 	}
 }
 
-// pingLoop keeps the connection provably alive: a ping every pingPeriod that the
-// server auto-pongs. Writes go through writeMu so they never interleave with a
-// Send. A failed write just ends the loop; the read side then errors and Run
-// reconnects.
 func (c *Conn) pingLoop(ctx context.Context, conn *websocket.Conn) {
 	t := time.NewTicker(pingPeriod)
 	defer t.Stop()
@@ -255,7 +224,6 @@ func (c *Conn) pingLoop(ctx context.Context, conn *websocket.Conn) {
 
 var errNotConnected = errors.New("link: not connected")
 
-// Send marshals and writes one message to the server.
 func (c *Conn) Send(m protocol.Msg) error {
 	c.mu.Lock()
 	conn := c.conn
@@ -269,5 +237,12 @@ func (c *Conn) Send(m protocol.Msg) error {
 	}
 	c.writeMu.Lock()
 	defer c.writeMu.Unlock()
-	return conn.WriteMessage(websocket.TextMessage, data)
+	if err := conn.SetWriteDeadline(time.Now().Add(writeWait)); err != nil {
+		return err
+	}
+	if err := conn.WriteMessage(websocket.TextMessage, data); err != nil {
+		conn.Close()
+		return err
+	}
+	return nil
 }

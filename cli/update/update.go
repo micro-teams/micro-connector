@@ -1,16 +1,30 @@
-// Package update fetches a fresh binary from the control plane and swaps it in
-// place. It carries the platform→artifact mapping the installer uses
-// (frontend/scripts/build-connector.mjs + install.sh), downloads the matching
-// binary next to the running executable, verifies it is a real, runnable binary,
-// and atomically replaces the current one. Handing the process off to the new
-// binary (so a running service keeps its tmux) is the caller's job; this package
-// only produces a verified, in-place replacement.
+// Package update replaces the running binary with the one the control plane publishes. It
+// downloads the binary for this platform next to the running executable, proves it runs, and swaps
+// it in atomically. Handing the process over to the new binary (re-exec, so the screens' tmux
+// keeps running) is the caller's part.
+//
+// Binaries are published at <origin of base><BinaryBase>/<os>-<arch>/<name>, with <os>-<arch> one
+// of linux-amd64, linux-arm64, darwin-amd64, darwin-arm64.
+//
+//	PlatformDir() (string, error)          <os>-<arch> of this process.
+//	Fetch(ctx, base, name) (string, error) downloads binary `name` (e.g. brand.Current.Name, or a
+//	                                       helper binary published beside it) into a temp file in
+//	                                       the executable's directory, makes it executable, and
+//	                                       checks `<file> --version` succeeds; returns the file.
+//	Replace(tmpPath, selfPath) error       renames tmpPath onto selfPath (atomic: same directory).
+//	SelfPath() (string, error)             the running executable, symlinks resolved.
+//
+// Example:
+//
+//	tmp, err := update.Fetch(ctx, cfg.Base, brand.Current.Name)
+//	self, err := update.SelfPath()
+//	err = update.Replace(tmp, self)
+//	syscall.Exec(self, os.Args, os.Environ())
 package update
 
 import (
 	"context"
 	"fmt"
-	"github.com/micro-teams/micro-connector/cli/brand"
 	"io"
 	"net/http"
 	"net/url"
@@ -19,127 +33,92 @@ import (
 	"path/filepath"
 	"runtime"
 	"time"
+
+	"github.com/micro-teams/micro-connector/cli/brand"
 )
 
-// platformDir maps a GOOS/GOARCH pair to the `<os>-<arch>` directory the server
-// actually serves artifacts under — `linux-amd64` / `linux-arm64` / `darwin-amd64`
-// / `darwin-arm64`. This MUST match install.sh's `target` and the installer route's
-// accepted targets (api/routes/installer.py `_TARGET_RE`), which are Go-style
-// (amd64/arm64), NOT uname-style (x86_64/aarch64). Kept pure so it is unit-testable.
 func platformDir(goos, goarch string) (string, error) {
-	switch goos {
-	case "linux", "darwin":
-	default:
-		return "", fmt.Errorf("update: unsupported OS %q (this connector runs on Linux and macOS)", goos)
+	if goos != "linux" && goos != "darwin" {
+		return "", fmt.Errorf("update: no published binary for OS %q", goos)
 	}
-	switch goarch {
-	case "amd64", "arm64":
-	default:
-		return "", fmt.Errorf("update: unsupported arch %q (this connector ships amd64 and arm64)", goarch)
+	if goarch != "amd64" && goarch != "arm64" {
+		return "", fmt.Errorf("update: no published binary for architecture %q", goarch)
 	}
 	return goos + "-" + goarch, nil
 }
 
-// PlatformDir returns the artifact directory for the running platform.
 func PlatformDir() (string, error) { return platformDir(runtime.GOOS, runtime.GOARCH) }
 
-// binaryURL is the published location of this brand's binary for dir, at the
-// server's *origin* (scheme://host of base) — the connector artifacts live at
-// `<origin><BinaryBase>/<os>-<arch>/<name>`, at the origin root, never under
-// the `/api` edge prefix (see CLAUDE.md §"Backend is always the frontend origin").
-func binaryURL(base, dir string) (string, error) {
+func binaryURL(base, dir, name string) (string, error) {
 	u, err := url.Parse(base)
 	if err != nil || u.Host == "" {
 		return "", fmt.Errorf("update: bad base %q: %v", base, err)
 	}
-	origin := u.Scheme + "://" + u.Host
-	return origin + brand.Current.BinaryBase + "/" + dir + "/" + brand.Current.Name, nil
+	return u.Scheme + "://" + u.Host + brand.Current.BinaryBase + "/" + dir + "/" + name, nil
 }
 
-// Fetch downloads the current platform's `microteams` binary from base's origin into a
-// temp file in the SAME directory as the running executable (so a later os.Rename
-// onto the executable is atomic), makes it executable, and verifies it is a real,
-// runnable binary by executing `<temp> --version` under a timeout. On any failure
-// the temp file is removed and an error is returned — the caller must keep running
-// the current binary unchanged. On success it returns the temp file path; the
-// caller replaces the executable with Replace and hands off.
-func Fetch(ctx context.Context, base string) (string, error) {
+func Fetch(ctx context.Context, base, name string) (string, error) {
 	dir, err := PlatformDir()
 	if err != nil {
 		return "", err
 	}
-	rawURL, err := binaryURL(base, dir)
+	rawURL, err := binaryURL(base, dir, name)
 	if err != nil {
 		return "", err
 	}
-	self, err := os.Executable()
+	self, err := SelfPath()
 	if err != nil {
 		return "", fmt.Errorf("update: locate self: %w", err)
 	}
-	self, _ = filepath.EvalSymlinks(self)
-	destDir := filepath.Dir(self)
-
-	tmp, err := os.CreateTemp(destDir, ".microteams-update-*")
+	tmp, err := os.CreateTemp(filepath.Dir(self), "."+name+"-update-*")
 	if err != nil {
 		return "", fmt.Errorf("update: temp file: %w", err)
 	}
-	tmpPath := tmp.Name()
-	cleanup := func() { tmp.Close(); os.Remove(tmpPath) }
-
-	dlCtx, cancel := context.WithTimeout(ctx, 5*time.Minute)
+	if err := download(ctx, rawURL, tmp); err != nil {
+		tmp.Close()
+		os.Remove(tmp.Name())
+		return "", err
+	}
+	if err := tmp.Close(); err != nil {
+		os.Remove(tmp.Name())
+		return "", fmt.Errorf("update: close: %w", err)
+	}
+	if err := os.Chmod(tmp.Name(), 0o755); err != nil {
+		os.Remove(tmp.Name())
+		return "", fmt.Errorf("update: chmod: %w", err)
+	}
+	// A truncated download, an error page or a binary for another platform fails here, before it
+	// can replace anything.
+	vctx, cancel := context.WithTimeout(ctx, 20*time.Second)
 	defer cancel()
-	req, err := http.NewRequestWithContext(dlCtx, http.MethodGet, rawURL, nil)
+	if err := exec.CommandContext(vctx, tmp.Name(), "--version").Run(); err != nil {
+		os.Remove(tmp.Name())
+		return "", fmt.Errorf("update: the downloaded %s does not run: %w", name, err)
+	}
+	return tmp.Name(), nil
+}
+
+func download(ctx context.Context, rawURL string, w io.Writer) error {
+	ctx, cancel := context.WithTimeout(ctx, 5*time.Minute)
+	defer cancel()
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, rawURL, nil)
 	if err != nil {
-		cleanup()
-		return "", fmt.Errorf("update: request: %w", err)
+		return fmt.Errorf("update: request: %w", err)
 	}
 	resp, err := http.DefaultClient.Do(req)
 	if err != nil {
-		cleanup()
-		return "", fmt.Errorf("update: download %s: %w", rawURL, err)
+		return fmt.Errorf("update: download %s: %w", rawURL, err)
 	}
 	defer resp.Body.Close()
 	if resp.StatusCode != http.StatusOK {
-		cleanup()
-		return "", fmt.Errorf("update: download %s: HTTP %d", rawURL, resp.StatusCode)
+		return fmt.Errorf("update: download %s: %s", rawURL, resp.Status)
 	}
-	if _, err := io.Copy(tmp, resp.Body); err != nil {
-		cleanup()
-		return "", fmt.Errorf("update: write: %w", err)
-	}
-	if err := tmp.Close(); err != nil {
-		os.Remove(tmpPath)
-		return "", fmt.Errorf("update: close: %w", err)
-	}
-	if err := os.Chmod(tmpPath, 0o755); err != nil {
-		os.Remove(tmpPath)
-		return "", fmt.Errorf("update: chmod: %w", err)
-	}
-	if err := verify(ctx, tmpPath); err != nil {
-		os.Remove(tmpPath)
-		return "", err
-	}
-	return tmpPath, nil
-}
-
-// verify runs `<path> --version` under a short timeout to prove the freshly
-// downloaded file is a real, runnable binary for this platform (a truncated
-// download, an HTML error page, or a wrong-arch build would fail here) before we
-// let it replace the live executable.
-func verify(ctx context.Context, path string) error {
-	vctx, cancel := context.WithTimeout(ctx, 20*time.Second)
-	defer cancel()
-	cmd := exec.CommandContext(vctx, path, "--version")
-	if err := cmd.Run(); err != nil {
-		return fmt.Errorf("update: downloaded binary failed verification (%s --version): %w", path, err)
+	if _, err := io.Copy(w, resp.Body); err != nil {
+		return fmt.Errorf("update: download %s: %w", rawURL, err)
 	}
 	return nil
 }
 
-// Replace atomically moves tmpPath onto selfPath. Both are in the same directory
-// (Fetch guarantees it), so the rename is atomic; replacing a running
-// executable's path is fine on Linux/macOS (the old inode stays mapped until the
-// process exits).
 func Replace(tmpPath, selfPath string) error {
 	if err := os.Rename(tmpPath, selfPath); err != nil {
 		return fmt.Errorf("update: replace %s: %w", selfPath, err)
@@ -147,14 +126,10 @@ func Replace(tmpPath, selfPath string) error {
 	return nil
 }
 
-// SelfPath resolves the path of the running executable (symlinks evaluated).
 func SelfPath() (string, error) {
 	self, err := os.Executable()
 	if err != nil {
 		return "", err
 	}
-	if resolved, err := filepath.EvalSymlinks(self); err == nil {
-		return resolved, nil
-	}
-	return self, nil
+	return filepath.EvalSymlinks(self)
 }

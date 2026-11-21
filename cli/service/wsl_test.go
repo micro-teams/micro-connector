@@ -1,3 +1,4 @@
+// Tests for the WSL helpers: setting [boot] systemd = true changes only that key.
 package service
 
 import "testing"

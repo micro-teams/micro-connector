@@ -1,22 +1,39 @@
-// Package apiauth resolves how this machine authenticates to its control plane, and hands out an
-// http transport that applies it.
+// Package apiauth authenticates a machine's requests to its control plane: an http transport that
+// adds the credential to every request bound for the control plane's host.
 //
-// By default a machine speaks as itself: its durable token goes out as a bearer credential. That is
-// all a provisioning tool ever needs, and it is the default precisely because it is the smaller
-// claim.
+// By default a machine speaks as itself: its token is the bearer credential. A product whose
+// screens act for somebody sets ScreenExchange; inside a screen the machine's token and the
+// screen's token are then exchanged (once, cached until shortly before expiry) for a token of
+// whoever the screen represents, so a program in the terminal reaches the control plane as that
+// person rather than with the machine's authority.
 //
-// A product whose screens act on behalf of somebody can opt into a second step. Set ScreenExchange,
-// and inside a screen the machine's token plus the screen's token are exchanged, once and cached,
-// for a token belonging to whoever that screen represents — so the thing in the terminal reaches
-// the same guarded endpoints a person would, as that person, rather than borrowing the machine's
-// authority. Left nil, none of that machinery exists.
+// Environment, under the brand's prefix: <PREFIX>_API (base URL), <PREFIX>_TOKEN (credential),
+// <PREFIX>_SCREEN (the screen's token, which the connector sets in every screen).
 //
-// Environment overrides, under the brand's prefix: <PREFIX>_API (base URL), <PREFIX>_TOKEN
-// (credential), <PREFIX>_SCREEN (per-screen token, set by the host inside every screen it opens).
+//	ScreenTokenExchange{Path, SessionHeader, ScreenHeader}  the exchange endpoint and the headers
+//	                       carrying the machine's and the screen's tokens; answered with
+//	                       {"token", "expiresAt" (unix seconds)}.
+//	ScreenExchange         the product's exchange, or nil.
+//	APIBase() (string, error)    <PREFIX>_API, else the configured base; an error when neither.
+//	Transport() / TransportOver(base http.RoundTripper) (http.RoundTripper, error)
+//	                       the authenticating transport, over http.DefaultTransport or base (which
+//	                       issues the request; anything that rewrites hosts or retries goes there).
+//	Client() / ClientOver(base) (*http.Client, error)  the same in a client with a 30 s timeout.
+//
+// A failed exchange fails the request with its reason; nothing is sent unauthenticated.
+//
+// Example:
+//
+//	apiauth.ScreenExchange = &apiauth.ScreenTokenExchange{Path: "/agent/token",
+//		SessionHeader: "X-Session", ScreenHeader: "X-Screen"}
+//	c, err := apiauth.Client()
+//	resp, err := c.Get(base + "/me")
 package apiauth
 
 import (
 	"encoding/json"
+	"errors"
+	"fmt"
 	"net/http"
 	"net/url"
 	"strings"
@@ -27,89 +44,83 @@ import (
 	"github.com/micro-teams/micro-connector/cli/config"
 )
 
-// ScreenTokenExchange describes how a screen's own credential is obtained. A product that has no
-// such notion leaves ScreenExchange nil and every request goes out as the machine.
 type ScreenTokenExchange struct {
-	// Path is the control-plane endpoint that performs the exchange, e.g. "/agent/token".
-	Path string
-	// SessionHeader carries the machine's durable token; ScreenHeader carries the screen's.
+	Path          string
 	SessionHeader string
 	ScreenHeader  string
 }
 
-// ScreenExchange is the product's policy, set at startup beside the brand. nil means "the machine
-// speaks as itself", which is the default and the safer of the two.
 var ScreenExchange *ScreenTokenExchange
 
-// APIBase returns the control plane's base URL: the brand's API variable if set, else this
-// machine's configured base, else a localhost default.
-func APIBase() string {
+func APIBase() (string, error) {
 	if base := brand.Current.Getenv("API"); base != "" {
-		return strings.TrimRight(base, "/")
+		return strings.TrimRight(base, "/"), nil
 	}
-	if cfg, err := config.Load(config.DefaultPath()); err == nil && cfg.Base != "" {
-		return cfg.APIBase()
+	cfg, err := config.Load(config.DefaultPath())
+	if err != nil {
+		return "", fmt.Errorf("apiauth: no %s and no configuration: %w", brand.Current.Env("API"), err)
 	}
-	return "http://localhost:8080"
+	if cfg.Base == "" {
+		return "", errors.New("apiauth: the configuration has no base URL")
+	}
+	return cfg.APIBase(), nil
 }
 
-// resolveToken returns this machine's credential: MICROTEAMS_TOKEN if set, else the stored one.
-func resolveToken() string {
+func resolveToken() (string, error) {
 	if tok := brand.Current.Getenv("TOKEN"); tok != "" {
-		return tok
+		return tok, nil
 	}
-	if cfg, err := config.Load(config.DefaultPath()); err == nil {
-		return cfg.Token
+	cfg, err := config.Load(config.DefaultPath())
+	if err != nil {
+		return "", fmt.Errorf("apiauth: no %s and no configuration: %w", brand.Current.Env("TOKEN"), err)
 	}
-	return ""
+	return cfg.Token, nil
 }
 
-// Transport returns an http.RoundTripper that authenticates every request bound for the API host,
-// sending it over the standard transport.
-func Transport() http.RoundTripper { return TransportOver(nil) }
+func Transport() (http.RoundTripper, error) { return TransportOver(nil) }
 
-// TransportOver is Transport with the request finally issued by base rather than by the standard
-// transport. nil means http.DefaultTransport.
-//
-// The seam exists because authentication is not the only thing a product may want to do to its
-// outbound requests — one might route them over several network paths, another might record them —
-// and none of that belongs in this library. Authentication stays outermost either way, which is the
-// order that matters: this decides whether to attach a credential by looking at the host it was
-// configured for, so anything that rewrites the host has to run underneath it, and anything that
-// retries has to carry a request that is already authenticated.
-func TransportOver(base http.RoundTripper) http.RoundTripper {
+func TransportOver(base http.RoundTripper) (http.RoundTripper, error) {
 	if base == nil {
 		base = http.DefaultTransport
 	}
-	apiBase := APIBase()
-	host := ""
-	if u, err := url.Parse(apiBase); err == nil {
-		host = u.Host
+	apiBase, err := APIBase()
+	if err != nil {
+		return nil, err
+	}
+	u, err := url.Parse(apiBase)
+	if err != nil {
+		return nil, fmt.Errorf("apiauth: base %q: %w", apiBase, err)
+	}
+	token, err := resolveToken()
+	if err != nil {
+		return nil, err
 	}
 	return &bearerInjector{
 		base:    base,
-		host:    host,
+		host:    u.Host,
 		apiBase: apiBase,
-		token:   resolveToken(),
+		token:   token,
 		screen:  brand.Current.Getenv("SCREEN"),
 		exch:    ScreenExchange,
-	}
+	}, nil
 }
 
-// Client returns an http.Client that applies Transport() with a sane timeout.
-func Client() *http.Client { return ClientOver(nil) }
+func Client() (*http.Client, error) { return ClientOver(nil) }
 
-// ClientOver is Client over a caller-supplied base transport. See TransportOver.
-func ClientOver(base http.RoundTripper) *http.Client {
-	return &http.Client{Transport: TransportOver(base), Timeout: 30 * time.Second}
+func ClientOver(base http.RoundTripper) (*http.Client, error) {
+	t, err := TransportOver(base)
+	if err != nil {
+		return nil, err
+	}
+	return &http.Client{Transport: t, Timeout: 30 * time.Second}, nil
 }
 
 type bearerInjector struct {
 	base    http.RoundTripper
 	host    string
-	apiBase string // server base, for the /agent/token exchange
-	token   string // this machine's durable token
-	screen  string // per-screen token; non-empty only inside a screen
+	apiBase string
+	token   string
+	screen  string
 	exch    *ScreenTokenExchange
 
 	mu       sync.Mutex
@@ -118,53 +129,54 @@ type bearerInjector struct {
 }
 
 func (b *bearerInjector) RoundTrip(req *http.Request) (*http.Response, error) {
-	if req.URL.Host == b.host && req.Header.Get("Authorization") == "" {
-		if b.screen != "" && b.exch != nil {
-			if jwt := b.agentToken(); jwt != "" {
-				req = req.Clone(req.Context())
-				req.Header.Set("Authorization", "Bearer "+jwt)
-			}
-		} else if b.token != "" {
-			req = req.Clone(req.Context())
-			req.Header.Set("Authorization", "Bearer "+b.token)
+	if req.URL.Host != b.host || req.Header.Get("Authorization") != "" {
+		return b.base.RoundTrip(req)
+	}
+	cred := b.token
+	if b.screen != "" && b.exch != nil {
+		jwt, err := b.agentToken()
+		if err != nil {
+			return nil, err
 		}
+		cred = jwt
+	}
+	if cred != "" {
+		req = req.Clone(req.Context())
+		req.Header.Set("Authorization", "Bearer "+cred)
 	}
 	return b.base.RoundTrip(req)
 }
 
-// agentToken returns the screen's own token, exchanging the machine + screen tokens for a fresh one
-// when the cache is empty or near expiry. Returns "" on failure — the call then goes out
-// unauthenticated and the control plane answers 401, which surfaces as an ordinary API error rather
-// than as something mysterious.
-func (b *bearerInjector) agentToken() string {
+// agentToken returns the screen's own token, exchanging for a fresh one when the cached one is
+// missing or within 30 s of expiry. The exchange goes through the base transport, not this one.
+func (b *bearerInjector) agentToken() (string, error) {
 	b.mu.Lock()
 	defer b.mu.Unlock()
 	if b.agentJWT != "" && time.Now().Before(b.agentExp.Add(-30*time.Second)) {
-		return b.agentJWT
+		return b.agentJWT, nil
 	}
 	req, err := http.NewRequest(http.MethodPost, b.apiBase+b.exch.Path, nil)
 	if err != nil {
-		return ""
+		return "", fmt.Errorf("apiauth: token exchange: %w", err)
 	}
 	req.Header.Set(b.exch.SessionHeader, b.token)
 	req.Header.Set(b.exch.ScreenHeader, b.screen)
-	// Go through the underlying transport, not this injector, so the exchange cannot recurse.
 	resp, err := b.base.RoundTrip(req)
 	if err != nil {
-		return ""
+		return "", fmt.Errorf("apiauth: token exchange: %w", err)
 	}
 	defer resp.Body.Close()
 	if resp.StatusCode != http.StatusOK {
-		return ""
+		return "", fmt.Errorf("apiauth: token exchange: %s", resp.Status)
 	}
 	var out struct {
 		Token     string `json:"token"`
 		ExpiresAt int64  `json:"expiresAt"`
 	}
-	if json.NewDecoder(resp.Body).Decode(&out) != nil || out.Token == "" {
-		return ""
+	if err := json.NewDecoder(resp.Body).Decode(&out); err != nil || out.Token == "" {
+		return "", fmt.Errorf("apiauth: token exchange: unreadable answer (%v)", err)
 	}
 	b.agentJWT = out.Token
 	b.agentExp = time.Unix(out.ExpiresAt, 0)
-	return b.agentJWT
+	return b.agentJWT, nil
 }

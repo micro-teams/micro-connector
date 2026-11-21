@@ -1,7 +1,7 @@
 # The contract
 
 What a control plane and a connector say to each other, and what each may assume of the other. This
-document is the durable half of the specification; `testbed/server.py` is the executable half, and
+document is the durable half of the specification; `testbed/server` is the executable half, and
 the two are kept in step by the end-to-end test that runs against it.
 
 Read this if you are implementing a control plane. If you are implementing a connector, use the Go
@@ -10,17 +10,8 @@ library — it already speaks all of this.
 ## The shape of it
 
 A machine dials **out**. Nothing dials in, no port is opened, and everything below travels over one
-transport of the control plane's choosing:
-
-- a **resident WebSocket** (`cli/transport/ws`) if screens are long-lived and the control plane must
-  reach them at any moment — a message can arrive whenever, so somebody has to be listening;
-- **HTTP polling** (`cli/transport/httppoll`) if the work is a single command that drives one screen
-  and exits, where a connection to maintain is a liability rather than an asset.
-
-Both are in the library, and a product picks one by handing it to the screen manager.
-
-The message set is identical either way. A transport that changes the messages is a fork, not an
-implementation.
+resident WebSocket (`cli/transport/ws`): screens are long-lived and the control plane must reach them
+at any moment, so the machine keeps a connection open and reconnects whenever it drops.
 
 Every message is one JSON object with a `t` field naming its type, and only the fields that type
 uses. Unknown types must be ignored; unknown fields must be ignored. Both rules exist so an older
@@ -30,7 +21,8 @@ machines are not upgraded in lockstep, ever.
 ## Version
 
 `v` carries the protocol version, announced by both ends when a connection opens (`hello` up,
-`welcome` down). It is currently **1**.
+`welcome` down). It is currently **2**: version 2 added viewers (the `viewer` field, `screen.size`,
+`screen.ack`), the input lease and `screen.capture`, and removed `screen.scroll`.
 
 It changes only when the message set changes in a way an older peer cannot survive — which is rarer
 than a release, and is why it is not the product's version number. Adding a message type or a field
@@ -51,7 +43,7 @@ POST <base>/machine/enroll/poll    { "code": "ABC123" }
 ```
 
 The connector shows `approveUrl` to whoever is standing there and polls every `interval` seconds
-until the answer is not `pending`. What happens on that link — a human approving, a tenant's API
+(2 when the field is absent) until the answer is not `pending`. What happens on that link — a human approving, a tenant's API
 approving, a pre-issued credential being accepted — is the control plane's business entirely.
 
 The path prefix is the product's (`EnrollBase`); the field names above are not negotiable, because
@@ -68,23 +60,18 @@ A screen is a program in a terminal on the machine, identified by a control-plan
 
 | `t` | fields | meaning |
 |---|---|---|
-| `session.create` | `sid`, `command`, `env`, `cols`, `rows`, `source`, `screen`, `adopt` | Open a screen. If a session with this `sid` already exists on the machine, it is **adopted** rather than replaced — see below. `source` is the applet's JavaScript. `screen` is an opaque per-screen token the connector injects into the program's environment. |
-| `script.load` | `sid`, `source` | Replace the applet on a live screen. The program keeps running. This is how a fix reaches every machine without shipping a binary. |
+| `session.create` | `sid`, `command`, `env`, `cols`, `rows`, `source`, `screen`, `adopt` | Open a screen of `cols` x `rows`. A session with this `sid` that is still running is **adopted** instead — see below. `source` is the applet's JavaScript; an adopted screen reloads it only when it differs from the one running. `screen` is an opaque per-screen token the connector puts in the program's environment. The program's environment also has `<PREFIX>_TMUX`, the tmux binary hosting it, and `TMPDIR`, a directory of its own. With `adopt` and no `command`, a screen that is not running is reported with `session.error`, never started. |
 | `var.set` | `sid`, `name`, `value` | Set a variable the applet observes. |
 | `rpc.call` | `sid`, `id`, `name`, `args` | Call a function the applet exposed. Answered with `rpc.result`. |
 | `rpc.result` | `sid`, `id`, `value`, `error` | Answer a call the applet made. **Every call must be answered**, or the applet waits forever. |
-| `screen.subscribe` | `sid`, `cols`, `rows` | Attach a viewer: raw terminal bytes start flowing as `screen.data`. |
-| `screen.unsubscribe` | `sid` | Detach the viewer. The program is untouched. |
-| `screen.input` | `sid`, `data` | Base64 keystrokes from a viewer, straight to the terminal. |
-| `screen.scroll` | `sid`, `dir` | `up` / `down` / `bottom` — the viewer paging through scrollback. |
-| `screen.resize` | `sid`, `cols`, `rows` | Resize. Viewers re-send their size continuously; the connector only acts on a change. |
-| `session.close` | `sid` | Tear the screen down. |
-| `exec` | `id`, `command`, `cwd`, `stdin`, `timeout` | Run one command on the machine. Answered with `exec.result`. |
-| `exec.cancel` | `id` | Stop an in-flight `exec`. |
-| `file.write` | `id`, `path`, `data` | Write base64 `data` to `path` on the machine, creating parent directories and replacing any existing file atomically. Answered with `file.write.result`. No shell involved — `os.WriteFile` under the hood, so this works identically on every platform the connector targets. |
-| `file.read` | `id`, `path` | Read `path`. Answered with `file.read.result`; a missing file is answered as success with empty `data`, not an error (matching `cat 2>/dev/null \|\| true`, which this exists to replace). |
-| `file.remove` | `id`, `path` | Delete `path`. Answered with `file.remove.result`; a file that is already gone is success (matching `rm -f`). |
-| `homedir` | `id` | Ask this machine's real home directory. Answered with `homedir.result`. |
+| `screen.subscribe` | `sid`, `viewer`, `cols`, `rows` | Attach a viewer whose view has room for `cols` x `rows`. It gets its own tmux client: `screen.size`, then `screen.data` with a complete paint. |
+| `screen.resize` | `sid`, `viewer`, `cols`, `rows` | The room a viewer has changed. |
+| `screen.unsubscribe` | `sid`, `viewer` | Detach the viewer. The program is untouched. |
+| `screen.input` | `sid`, `viewer`, `data`, `op` | Base64 input from a viewer: keys, pastes, and mouse sequences (the wheel scrolls). Subject to the input lease, except with `op` `reply`: the viewer terminal's answers to tmux's queries (device attributes, cursor position), which tmux consumes. The lease coordinates people who trust each other; it is not access control. |
+| `screen.ack` | `sid`, `viewer`, `n` | The viewer has rendered `n` more bytes of `screen.data`. |
+| `screen.lease` | `sid`, `viewer`, `op` | `take`, `renew` or `release` the input lease. |
+| `screen.capture` | `sid`, `viewer`, `id` | Ask for the screen's text. Answered with `screen.capture.result`. |
+| `session.close` | `sid` | End the screen's program. |
 | `update` | — | Ask the machine to update its own binary. What that means is the product's. |
 
 ### Machine → control plane
@@ -92,28 +79,38 @@ A screen is a program in a terminal on the machine, identified by a control-plan
 | `t` | fields | meaning |
 |---|---|---|
 | `session.ready` | `sid` | The screen exists. |
-| `session.error` | `sid`, `error` | Something went wrong with this screen — **including that its session is gone**. See "A screen that dies". |
+| `session.error` | `sid`, `error` | The screen is gone or could not be made. See "A screen that dies". A tmux that does not answer is asked again, never reported as a missing screen. |
 | `var.push` | `sid`, `name`, `value` | An applet-owned variable changed. |
 | `rpc.call` | `sid`, `id`, `name`, `args` | The applet is calling the control plane. Must be answered with `rpc.result`. |
 | `rpc.result` | `sid`, `id`, `value`, `error` | The answer to a `rpc.call` from the control plane. |
-| `screen.data` | `sid`, `data` | Base64 terminal bytes for the attached viewer. |
-| `exec.result` | `id`, `stdout`, `stderr`, `exit`, `truncated` | The result of an `exec`. `truncated` means output hit the size cap. |
-| `file.write.result` | `id`, `error` | The result of a `file.write`. Empty `error` is success. |
-| `file.read.result` | `id`, `data`, `error` | The result of a `file.read`. |
-| `file.remove.result` | `id`, `error` | The result of a `file.remove`. |
-| `homedir.result` | `id`, `path`, `error` | The result of a `homedir` — `path` carries the resolved directory (reused rather than a new field, since that's exactly what it is). |
+| `screen.size` | `sid`, `viewer`, `cols`, `rows` | The terminal's size from now on. Sent before any data at that size; the viewer shows exactly this size. |
+| `screen.data` | `sid`, `viewer`, `data` | Base64 terminal bytes for that viewer only. |
+| `screen.lease.state` | `sid`, `viewer`, `holder` | Who holds the input lease: `""` (free), `"driver"` (the applet), or a viewer id. Sent to every viewer on each change, and to a viewer whose input or `take` was refused. |
+| `screen.capture.result` | `sid`, `viewer`, `id`, `data`, `error` | Base64 text of the screen with up to 2000 lines of history, wrapped lines joined. |
+| `screen.error` | `sid`, `viewer`, `error` | Something failed for one viewer (it is not subscribed, its client ended). The screen itself is fine. |
 
-### `file.*` and `homedir`, and why they are not `exec`
+### Viewers
 
-A control plane that needs to write a file to a machine — a CA cert, a credential, a settings file —
-could do it with `exec` and a shell script (`mkdir -p ... && base64 -d ... > ...`), and that is
-exactly how this used to work. The trouble is that "a shell script" quietly means "a Unix machine":
-it assumes `bash` (or something bash-compatible) is on the machine, which is never true on native
-Windows and cannot be assumed even on Unix. `file.write` / `file.read` / `file.remove` / `homedir`
-exist so a control plane never has to know or generate shell syntax for this at all — the connector
-does it with `os.WriteFile` / `os.ReadFile` / `os.Remove` / `os.UserHomeDir`, which behave the same
-on every platform this connector targets. Use `exec` for what is genuinely running a program;
-use these for moving a file or asking where home is.
+`viewer` is an id the control plane chooses for each person watching a screen (`"driver"` is
+reserved). The window is the smallest room over the subscribed viewers; every viewer is told the
+size with `screen.size` and shows the terminal at exactly that size, centred in its view. With no
+viewers the window keeps its size.
+
+A viewer acknowledges what it has rendered with `screen.ack`. The connector stops reading a viewer's
+client once 256 KiB are unacknowledged; tmux then stops sending it every change and repaints it whole
+when it catches up, so a slow viewer gets a fresh screen instead of a backlog, and never slows the
+others. The viewer `""` is a single shared viewer that never acknowledges.
+
+### The input lease
+
+A screen's input is free or held by one party. Input from a viewer on a free screen takes the lease;
+input or `renew` keeps it; it lapses 3 s after the last renewal, on `release`, or when the viewer
+unsubscribes. Input or `take` from anyone else while it is held is refused and answered with
+`screen.lease.state`, so a viewer can show who is typing. An applet may take the lease around input
+that must not be interleaved (`connector.term.hold`), and its input is refused while a viewer holds
+it. A viewer that keeps typing renews by typing; one that only reads should `release`. The drivers
+in `applets/` do not use the lease themselves: they buffer while the control plane sets their
+variable `viewerLevel` to `full`, which a control plane does while a person holds the lease.
 
 ### Adoption, and why it exists
 
@@ -142,11 +139,10 @@ only cure will be restarting something by hand.
 ## What an applet is given
 
 The applet is JavaScript, supplied by the control plane, running on the machine in a sandbox with no
-network and no filesystem of its own. It reaches the host through one global — `connector`, with the
-product's own name as an alias:
+network and no filesystem of its own. It reaches the host through one global, `connector`:
 
 ```
-connector.term.read() / .write(data) / .onChange(fn)
+connector.term.read() / .write(data) / .hold(on) / .onChange(fn)
 connector.own(name, initial)   // this applet owns it; the control plane mirrors it
 connector.watch(name)          // the control plane owns it; this applet observes it
 connector.expose(name, fn)     // the control plane may call this
@@ -154,13 +150,12 @@ connector.call(name, args)     // call the control plane; returns a thenable
 connector.log(message)
 ```
 
-A command applet (a product's own command tree, optional) is additionally given `command`, `http`,
-`exec`, `fs` and `print`.
-
 That list is short on purpose. Every product-specific feature belongs in an applet, which the
 control plane serves and can change today; a new host primitive means shipping a new binary to every
 machine, so adding one is a rare and deliberate act. A general capability (`exec` gaining a working
 directory) is right; a business-specific one (`gitPush()`) is not.
+
+`write` and `hold` return false when a viewer holds the input lease.
 
 `onChange` fires on screen changes **and** on a periodic heartbeat, because a dialog nobody is
 touching produces no change at all and still has to be answered.
@@ -177,7 +172,7 @@ touching produces no change at all and still has to be answered.
 
 ## The reference implementation
 
-`testbed/server.py` implements all of the above in a few hundred lines of standard-library Python,
+`testbed/server` implements all of the above in a few hundred lines of Go,
 and `testbed/e2e.sh` drives a real connector against it — including a real Claude Code — on every
 change. If this document and that server ever disagree, the server is right and this document is a
 bug.

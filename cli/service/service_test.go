@@ -1,9 +1,6 @@
-// Which service variant an action lands on — the decision T-039 got wrong.
-//
-// The real thing talks to systemd/launchd, so the decision is separated from the probing and tested
-// here with a fake probe: the interesting cases are all about *disagreeing* privilege (a system
-// service installed via sudo, acted on by an ordinary user), which is exactly what a machine's real
-// service manager would not let a test reproduce.
+// Tests for which installed variant an action lands on, with a fake probe in place of a service
+// manager: the cases that matter mix privileges (a system service installed with sudo, acted on by
+// an ordinary user), which a real service manager would not let a test set up.
 package service
 
 import "testing"

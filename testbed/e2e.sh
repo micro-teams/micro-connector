@@ -68,22 +68,22 @@ cleanup() {
 trap cleanup EXIT
 
 step "build the applets and a connector made only of the library"
-(cd "$ROOT/applets" && npm ci --silent >/dev/null 2>&1 || npm install --silent >/dev/null 2>&1; npm run build >/dev/null)
+(cd "$ROOT/applets" && npm ci --silent >/dev/null && npm run build >/dev/null)
 mkdir -p "$ROOT/testbed/bin"
-(cd "$ROOT/testbed/cli" && go build -o "$ROOT/testbed/bin/testconn" .)
+(cd "$ROOT/testbed" && go build -o bin/testconn ./connector && go build -o bin/testserver ./server)
 pass "built"
 
 step "start the reference control plane"
-APPLET_DIR="$ROOT/applets/dist" PORT="$PORT" python3 "$ROOT/testbed/server.py" >"$WORK/server.log" 2>&1 &
+"$ROOT/testbed/bin/testserver" -addr "127.0.0.1:$PORT" -applets "$ROOT/applets/dist" >"$WORK/server.log" 2>&1 &
 SRV_PID=$!
 for _ in $(seq 1 50); do curl -fsS "$BASE/test/state" >/dev/null 2>&1 && break; sleep 0.2; done
 curl -fsS "$BASE/test/state" >/dev/null || { cat "$WORK/server.log"; fail "the control plane never came up"; }
 pass "control plane up on $PORT"
 
 step "enrol a machine and connect it"
-# TMPDIR points at this run's own directory: the tmux socket path is derived from it, so the test
-# cannot reach a connector running on the same machine for real. That has gone wrong before.
-TMPDIR="$WORK" "$ROOT/testbed/bin/testconn" --base "$BASE" >"$WORK/conn.log" 2>&1 &
+# HOME and TMPDIR point at this run's own directory: the connector's tmux socket and state live
+# under them, so the test never reaches a tmux server it did not start.
+HOME="$WORK/connhome" TMPDIR="$WORK" XDG_RUNTIME_DIR="" "$ROOT/testbed/bin/testconn" --base "$BASE" >"$WORK/conn.log" 2>&1 &
 CONN_PID=$!
 for _ in $(seq 1 50); do grep -q "enrolled as" "$WORK/conn.log" 2>/dev/null && break; sleep 0.2; done
 grep -q "enrolled as" "$WORK/conn.log" || { cat "$WORK/conn.log"; fail "the machine never enrolled"; }
@@ -120,7 +120,8 @@ if [ "$LEG" != "fake" ]; then
   # Docker image's own build does it (see mock-server/mockserver's docker/Dockerfile) — their docs
   # page shows a different flag/subcommand for the separate -no-dependencies artifact, which is not
   # what this is.
-  java -jar "$MOCK_JAR" -p 1080 >"$WORK/mockserver.log" 2>&1 &
+  # From the run's own directory: MockServer writes its CA certificate into the working directory.
+  (cd "$WORK" && exec java -jar "$MOCK_JAR" -p 1080) >"$WORK/mockserver.log" 2>&1 &
   MOCK_PID=$!
   for _ in $(seq 1 60); do
     curl -fsS -X PUT "http://127.0.0.1:1080/mockserver/status" >/dev/null 2>&1 && break
@@ -173,7 +174,7 @@ JSON
                     "usage": { "inputTokens": 10, "outputTokens": 2 } } } }
 JSON
   else
-    # --- Claude Code, as before ---------------------------------------------------------------
+    # --- Claude Code ---------------------------------------------------------------
     step "install Claude Code ($LEG) and a mock Anthropic API"
     case "$LEG" in
       npm:*) npm install -g --silent "@anthropic-ai/claude-code@${LEG#npm:}" >/dev/null ;;
@@ -185,7 +186,7 @@ JSON
     echo "claude: $(claude --version 2>&1 | head -1)"
     pass "Claude Code installed, mock API up"
 
-    # Two details here were paid for the hard way:
+    # Two details matter here:
     #   * the tool list is matched with a JSON path, because Claude Code also asks this endpoint for a
     #     session title, with no tools at all — a once-only expectation is spent on that instead;
     #   * `streaming` is not optional: a non-streamed tool call is silently ignored, which looks
@@ -221,7 +222,9 @@ step "open a screen, and let the applet announce itself"
 HEARD="$WORK/heard.txt"; : >"$HEARD"
 if [ "$LEG" = "fake" ]; then
   APPLET="claude"
-  PROGRAM="while IFS= read -r line; do printf '%s\n' \"\$line\" >> $HEARD; done"
+  # It paints the footer the Claude Code driver takes as a prompt, since the driver types nothing
+  # before the program shows one.
+  PROGRAM="printf '? for shortcuts\\n'; while IFS= read -r line; do printf '%s\\n' \"\$line\" >> $HEARD; done"
   SCREEN_ENV='{}'
 elif [ "${LEG#pi:}" != "$LEG" ]; then
   APPLET="pi"
@@ -237,7 +240,7 @@ else
   # API mode: a base URL and a token are all Claude Code needs to skip login entirely, which is what
   # makes a real Claude Code testable at all without an account. HOME is this run's own, so the
   # first-run wizard and the permission gate appear exactly as they do on a brand-new machine —
-  # which is where the gate that used to kill the agent only ever showed up.
+  # which is where the riskiest gates show up.
   mkdir -p "$WORK/home/.claude"
   printf '{"hasCompletedOnboarding":true}' > "$WORK/home/.claude.json"
   # An absolute path, not the name: the program is started through a login shell, which re-reads the
@@ -270,8 +273,7 @@ if [ "$LEG" != "fake" ]; then
   step "let $PROG_NAME reach a working prompt"
   # Assert on the driver's own opinion rather than on the screen: what is under test is whether it
   # understands what it is looking at, so what it believes is the thing worth checking. A dead
-  # status here means a gate was answered wrongly — the failure that killed the first agent on every
-  # brand-new machine.
+  # status here means a gate was answered wrongly, which on a new machine ends the agent at once.
   for _ in $(seq 1 90); do
     ST="$(curl -fsS "$BASE/test/state" | python3 -c "import json,sys;print(json.load(sys.stdin)['screens'].get('$SID',{}).get('vars',{}).get('status',''))")"
     [ "$ST" = "dead" ] && { echo "--- connector ---"; cat "$WORK/conn.log"; echo "--- the pane ---"; pane; fail "$PROG_NAME exited during startup — a gate was answered wrongly"; }

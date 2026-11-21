@@ -1,27 +1,26 @@
-// Command testconn is a connector built from the library and nothing else.
+// Command testconn is a connector built from the library and nothing else: brand, enrolment, a
+// resident link and the screen manager. It has no screen handling of its own, because screen
+// handling is the library's job, which keeps a product's own connector this thin.
 //
-// It exists to keep two promises honest. The first is that a product's own code is thin: everything
-// below is brand, plumbing and one command — there is no screen handling here, because screen
-// handling is not a product's job. The second is that the one-shot shape works: this drives a
-// screen over HTTP polling, with no daemon, no WebSocket and no service to install, which is what a
-// provisioning tool needs and what MicroTeams' resident connector would otherwise have hidden.
+// Flags: -base, the control plane's base URL (default http://127.0.0.1:8099). It enrols, prints
+// "enrolled as <machine id>", then serves screens over ws://<base>/link until SIGINT or SIGTERM.
+// Example: testconn -base http://127.0.0.1:8099
 package main
 
 import (
 	"context"
 	"flag"
 	"fmt"
-	"net/http"
+	"strings"
 	"os"
 	"os/signal"
 	"syscall"
-	"time"
 
 	"github.com/micro-teams/micro-connector/cli/auth"
 	"github.com/micro-teams/micro-connector/cli/brand"
 	"github.com/micro-teams/micro-connector/cli/screen"
 	"github.com/micro-teams/micro-connector/cli/terminal"
-	"github.com/micro-teams/micro-connector/cli/transport/httppoll"
+	"github.com/micro-teams/micro-connector/cli/transport/ws"
 )
 
 func main() {
@@ -61,12 +60,13 @@ func main() {
 	ctx, cancel := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer cancel()
 
-	conn := httppoll.New(&http.Client{Timeout: 30 * time.Second}, *base, "/bus/inbox", "/bus/outbox", machineID, token)
+	conn := ws.New("ws"+strings.TrimPrefix(*base, "http")+"/link", token, *base)
 	mgr := screen.NewManager(ctx, conn, tm)
 	mgr.OnScreensChanged = func(live int) { fmt.Println("screens:", live) }
 
-	defer mgr.CloseAll()
+	// This connector's tmux server is the test run's own (under its HOME), so it goes with it.
 	defer tm.KillServer()
+	defer mgr.Detach()
 	fmt.Println("connected; waiting for the control plane")
 	_ = conn.Run(ctx, mgr.Dispatch)
 }

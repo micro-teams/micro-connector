@@ -1,8 +1,11 @@
-module github.com/micro-teams/micro-connector/testbed/cli
+module github.com/micro-teams/micro-connector/testbed
 
 go 1.25.0
 
-require github.com/micro-teams/micro-connector/cli v0.0.0
+require (
+	github.com/gorilla/websocket v1.5.3
+	github.com/micro-teams/micro-connector/cli v0.0.0
+)
 
 require (
 	github.com/creack/pty v1.1.24 // indirect
@@ -13,4 +16,4 @@ require (
 	golang.org/x/text v0.3.8 // indirect
 )
 
-replace github.com/micro-teams/micro-connector/cli => ../../cli
+replace github.com/micro-teams/micro-connector/cli => ../cli

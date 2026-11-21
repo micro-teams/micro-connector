@@ -1,14 +1,61 @@
-// Package terminal hosts programs in a private tmux server and exposes each as
-// a read/write surface with change notifications. It has no idea what runs
-// inside — it spawns whatever argv it is handed, snapshots the screen, writes
-// bytes, and reports when the screen changed.
+// Package terminal hosts programs in a private tmux server. It knows nothing about what runs inside:
+// it spawns an argv, reads and writes the screen, sizes the window, and attaches a real tmux client
+// for each viewer.
+//
+// One tmux server per user and brand holds every screen, on a socket under the brand's runtime
+// path. The server outlives the process that started it, so a connector that restarts or replaces
+// itself finds its screens again by name. Its configuration makes tmux an invisible substrate: no
+// status line, no prefix key, the mouse on (so a viewer's wheel scrolls tmux history or reaches a
+// program that asked for the mouse), and the clipboard passed through as OSC 52. Every window is
+// sized only by the connector: Spawn and Resize pin it with resize-window, which makes the window's
+// own window-size manual, so a client attaching at another size cannot change it.
+//
+// Manager
+//
+//	NewManager() (*Manager, error)
+//	    Finds tmux (the brand's TMUX variable, then <config>/<brand>/bin/tmux, then PATH) and
+//	    applies the configuration to the server, starting it if needed. ErrUnsupported on Windows.
+//	(*Manager).Spawn(name, argv, env []string, cols, rows int) (*Session, error)
+//	    Starts argv in a new session of the given size; env holds KEY=VALUE pairs.
+//	(*Manager).Adopt(name) *Session
+//	    Wraps a session that already exists, e.g. after the connector restarted.
+//	(*Manager).HasSession(name) (bool, error)
+//	    false only when tmux says the session or the server does not exist; any other failure is
+//	    an error, because a busy tmux is not a dead screen.
+//	(*Manager).LiveSessions() (int, error)
+//	    How many sessions the server has; 0 when no server runs.
+//	(*Manager).Bin() string
+//	    The tmux binary this manager runs.
+//	(*Manager).KillServer() error
+//	    Ends every session. For uninstalling and for tests, never for stopping a connector.
+//
+// Session
+//
+//	Name() string; Snapshot() string (the last polled screen, plain text)
+//	OnChange(fn)  starts a 400 ms poller and calls fn on every change, and every 1.2 s regardless,
+//	              so a driver can act on a screen that stays the same.
+//	OnGone(fn)    calls fn once when tmux confirms the session no longer exists.
+//	Write(p) error  types p into the program, leaving copy-mode first; long input is chunked.
+//	LeaveMode() error  leaves copy-mode (a viewer scrolled back) so the live screen shows again.
+//	Resize(cols, rows) error  sets the window size; every client must be sized to match.
+//	Text(history int) (string, error)  the screen as text, wrapped lines joined, with up to
+//	              history lines of scrollback above it.
+//	Attach(cols, rows, window, onData, onEnd) (*Client, error)  see client.go.
+//	Stop()        stops polling and leaves the program running.
+//	Close() error stops polling and kills the session.
+//
+// Example:
+//
+//	tm, err := terminal.NewManager()
+//	s, err := tm.Spawn("s1", []string{"bash"}, nil, 120, 32)
+//	s.OnChange(func() { fmt.Println(s.Snapshot()) })
+//	err = s.Write([]byte("echo hi\r"))
 package terminal
 
 import (
 	"bytes"
 	"errors"
 	"fmt"
-	"github.com/micro-teams/micro-connector/cli/brand"
 	"net"
 	"os"
 	"os/exec"
@@ -19,41 +66,43 @@ import (
 	"sync"
 	"time"
 
-	"github.com/creack/pty"
+	"github.com/micro-teams/micro-connector/cli/brand"
 )
 
-// Manager owns one private tmux server (a single unix socket). Every hosted
-// program is a tmux session inside it, keyed by an opaque name.
+// ErrUnsupported means this platform cannot host a screen at all: the pty package Attach relies on
+// has no Windows implementation, so no tmux build would help there.
+var ErrUnsupported = errors.New("terminal: screens are not supported on this platform")
+
+// config is the server's configuration. It is applied on every NewManager, not only when the
+// server starts, because a server that outlived an older connector must take the current one.
+const config = `set -g remain-on-exit on
+set -g status off
+set -g prefix None
+set -g prefix2 None
+set -g mouse on
+set -g escape-time 0
+set -g history-limit 10000
+set -g window-size smallest
+set -g set-clipboard on
+set -as terminal-features ',xterm-256color:clipboard'
+`
+
+// Manager owns the private tmux server.
 type Manager struct {
 	bin  string
 	sock string
 	conf string
 }
 
-// ErrUnsupported means this platform cannot host a screen at all — not "tmux is missing and could
-// be installed", but "no tmux build exists here that would work". Native Windows is the case today:
-// even a tmux.exe on PATH would not help, because Attach's pty (github.com/creack/pty) is itself a
-// stub on windows (see its start_windows.go) and always fails. Callers use errors.Is(err,
-// ErrUnsupported) to tell "this machine/platform just doesn't do screens" (log and carry on) apart
-// from "tmux should be here and isn't" (a real misconfiguration worth surfacing).
-var ErrUnsupported = errors.New("terminal: screens are not supported on this platform")
-
-// findTmux prefers a private tmux owned by this installation over whatever the host system happens
-// to have: the brand's own TMUX variable, then <user-config>/<brand>/bin/tmux (placed there by an
-// installer), then PATH as a last resort. This keeps the connector self-contained — a machine
-// without tmux works once the installer drops one in, and a machine with a quirky system tmux is
-// never at its mercy.
 func findTmux() (string, error) {
-	// Short-circuit rather than let a PATH tmux.exe (WSL/Cygwin/MSYS builds exist) get this far and
-	// fail confusingly later: the pty this package attaches through has no Windows implementation,
-	// so no tmux binary on native Windows would ever work.
 	if runtime.GOOS == "windows" {
 		return "", ErrUnsupported
 	}
 	if p := brand.Current.Getenv("TMUX"); p != "" {
-		if _, err := os.Stat(p); err == nil {
-			return p, nil
+		if _, err := os.Stat(p); err != nil {
+			return "", fmt.Errorf("terminal: %s points at %q: %w", brand.Current.Env("TMUX"), p, err)
 		}
+		return p, nil
 	}
 	if base, err := os.UserConfigDir(); err == nil {
 		p := filepath.Join(base, brand.Current.ConfigDir, "bin", "tmux")
@@ -67,57 +116,33 @@ func findTmux() (string, error) {
 	return "", fmt.Errorf("terminal: no tmux found (install one, or place a private copy at <config>/%s/bin/tmux)", brand.Current.ConfigDir)
 }
 
-// NewManager locates tmux and provisions a private, short-path socket dir. It
-// writes a tiny config that keeps a pane after its program exits: read when the
-// server first starts (via -f), so it applies before any command can run and a
-// program that dies instantly still leaves its output and a dead marker on
-// screen instead of tearing the server down.
 func NewManager() (*Manager, error) {
 	bin, err := findTmux()
 	if err != nil {
 		return nil, err
 	}
-	// A STABLE per-user runtime dir — NOT a fresh MkdirTemp each start. The tmux
-	// server daemonizes and outlives the connector process; a restarted or self-updated
-	// (syscall.Exec) connector must reconnect to the SAME socket to find and re-adopt the
-	// surviving sessions. A random dir per process would strand them on an orphan
-	// socket (which is exactly what broke in-place update before this).
 	dir := brand.Current.RuntimePath()
-	// An update in place must arrive back at the socket the previous build left running. Earlier
-	// builds put it under $XDG_RUNTIME_DIR when the process had one, and before that under the temp
-	// dir, so if a tmux server still answers in either, keep using it for this process rather than
-	// starting a second one and orphaning whatever it is hosting. New machines and later restarts
-	// get the new path; nobody loses a session in the crossing. Only a server that answers counts:
-	// a socket file left by a dead one, or a directory with no socket (which `status` from a login
-	// shell used to create), would otherwise send this process somewhere the service is not.
+	// A server still answering at a location an older connector used keeps hosting its screens;
+	// moving to the current path would orphan them, so this process joins it there instead.
 	for _, old := range []string{brand.Current.XDGRuntimePath(), brand.Current.LegacyRuntimePath()} {
 		if old != "" && old != dir && answers(filepath.Join(old, "t.sock")) {
 			dir = old
 			break
 		}
 	}
-	// Before this moved off /tmp, the directory was one that always worked. Now it is under $HOME,
-	// and that can be unwritable, missing, or hidden from the process — systemd's
-	// ProtectHome does exactly that. Failing here would mean a connector that will not start at all,
-	// which is a far worse day than a socket in a less private place, so the old location is the
-	// last resort rather than the error.
 	if err := os.MkdirAll(dir, 0o700); err != nil {
-		fallback := brand.Current.LegacyRuntimePath()
-		if fallback == dir {
-			return nil, fmt.Errorf("terminal: runtime dir: %w", err)
-		}
-		fmt.Fprintf(os.Stderr, "%s: cannot use %s (%v); falling back to %s\n",
-			brand.Current.Name, dir, err, fallback)
-		if err := os.MkdirAll(fallback, 0o700); err != nil {
-			return nil, fmt.Errorf("terminal: runtime dir: %w", err)
-		}
-		dir = fallback
+		return nil, fmt.Errorf("terminal: runtime dir: %w", err)
 	}
-	conf := filepath.Join(dir, "tmux.conf")
-	if err := os.WriteFile(conf, []byte("set -g remain-on-exit on\n"), 0o600); err != nil {
+	m := &Manager{bin: bin, sock: filepath.Join(dir, "t.sock"), conf: filepath.Join(dir, "tmux.conf")}
+	if err := os.WriteFile(m.conf, []byte(config), 0o600); err != nil {
 		return nil, fmt.Errorf("terminal: write config: %w", err)
 	}
-	return &Manager{bin: bin, sock: filepath.Join(dir, "t.sock"), conf: conf}, nil
+	if answers(m.sock) {
+		if err := m.run("source-file", m.conf); err != nil {
+			return nil, err
+		}
+	}
+	return m, nil
 }
 
 // answers reports whether something accepts connections on the unix socket at path.
@@ -126,65 +151,111 @@ func answers(path string) bool {
 	if err != nil {
 		return false
 	}
-	_ = c.Close() // only the accept mattered
+	c.Close()
 	return true
 }
 
-// Disabled returns a Manager that never actually hosts anything: every operation (Spawn,
-// HasSession, Attach, ...) fails cleanly through the exact same error-reporting path a real spawn
-// failure would (exec.Command with an empty Path errors "exec: no command" rather than panicking),
-// instead of a caller needing to nil-check a *Manager it never got.
-//
-// For a product that wants to keep running everything screens don't touch — the control
-// connection, the local proxy, enrolment — on a platform (or a machine) where NewManager returned
-// ErrUnsupported or any other error, rather than treating "no screens here" as fatal to the whole
-// process. Callers that DO need to know screens are unavailable should still check NewManager's own
-// error before falling back to this; Disabled exists for the ones that don't.
-func Disabled() *Manager { return &Manager{} }
-
 func (m *Manager) tmux(args ...string) *exec.Cmd {
-	full := append([]string{"-S", m.sock, "-f", m.conf}, args...)
-	cmd := exec.Command(m.bin, full...)
+	cmd := exec.Command(m.bin, append([]string{"-S", m.sock, "-f", m.conf}, args...)...)
 	cmd.Env = append(os.Environ(), "LC_ALL=C.UTF-8", "LANG=C.UTF-8")
 	return cmd
 }
 
-// KillServer tears down the whole private tmux server (and every session).
-func (m *Manager) KillServer() { _ = m.tmux("kill-server").Run() }
-
-// HasSession reports whether a tmux session named `name` already exists in this
-// private server — used to re-adopt a surviving session after the microteams process
-// re-execs itself (e.g. `microteams update`) without ever tearing down tmux.
-func (m *Manager) HasSession(name string) bool {
-	return m.tmux("has-session", "-t", name).Run() == nil
+// output runs a tmux command and returns its stdout, or an error carrying tmux's own message.
+func (m *Manager) output(args ...string) (string, error) {
+	var out, stderr bytes.Buffer
+	cmd := m.tmux(args...)
+	cmd.Stdout, cmd.Stderr = &out, &stderr
+	if err := cmd.Run(); err != nil {
+		return "", &tmuxError{args: args, err: err, msg: strings.TrimSpace(stderr.String())}
+	}
+	return out.String(), nil
 }
 
-// LiveSessions counts the sessions this private tmux server currently has. Zero also covers "no
-// server at all", which is the point: a caller asking how many screens are running wants the answer
-// tmux would give, not one remembered from when they were started.
-func (m *Manager) LiveSessions() int {
-	out, err := m.tmux("list-sessions", "-F", "#{session_name}").Output()
+func (m *Manager) run(args ...string) error {
+	_, err := m.output(args...)
+	return err
+}
+
+type tmuxError struct {
+	args []string
+	err  error
+	msg  string
+}
+
+func (e *tmuxError) Error() string {
+	return fmt.Sprintf("terminal: tmux %s: %v: %s", e.args[0], e.err, e.msg)
+}
+
+// absent reports whether err is tmux saying the session or the whole server does not exist.
+func absent(err error) bool {
+	var te *tmuxError
+	if !errors.As(err, &te) {
+		return false
+	}
+	return strings.HasPrefix(te.msg, "can't find session") || strings.HasPrefix(te.msg, "no server running") ||
+		strings.HasPrefix(te.msg, "error connecting to")
+}
+
+func (m *Manager) Bin() string { return m.bin }
+
+func (m *Manager) KillServer() error {
+	if err := m.run("kill-server"); err != nil && !absent(err) {
+		return err
+	}
+	return nil
+}
+
+func (m *Manager) HasSession(name string) (bool, error) {
+	err := m.run("has-session", "-t", "="+name)
+	if err == nil {
+		return true, nil
+	}
+	if absent(err) {
+		return false, nil
+	}
+	return false, err
+}
+
+func (m *Manager) LiveSessions() (int, error) {
+	out, err := m.output("list-sessions", "-F", "#{session_name}")
 	if err != nil {
-		return 0 // no server running, or nothing to list
-	}
-	n := 0
-	for _, line := range strings.Split(strings.TrimSpace(string(out)), "\n") {
-		if strings.TrimSpace(line) != "" {
-			n++
+		if absent(err) {
+			return 0, nil
 		}
+		return 0, err
 	}
-	return n
+	return len(strings.Fields(out)), nil
 }
 
-// Adopt wraps an already-existing tmux session (one that survived a process
-// re-exec) as a Session, without spawning anything. The caller must have checked
-// HasSession; the session's program keeps running untouched — only screen
-// polling/relay is (re)established around it.
+func (m *Manager) Spawn(name string, argv, env []string, cols, rows int) (*Session, error) {
+	if len(argv) == 0 {
+		return nil, errors.New("terminal: spawn: no command")
+	}
+	if cols <= 0 || rows <= 0 {
+		return nil, fmt.Errorf("terminal: spawn: size %dx%d", cols, rows)
+	}
+	launch := argv
+	if len(env) > 0 {
+		// Through env(1), so the variables reach the program and everything it starts.
+		launch = append(append([]string{"env"}, env...), argv...)
+	}
+	args := append([]string{"new-session", "-d", "-s", name, "-x", strconv.Itoa(cols), "-y", strconv.Itoa(rows)}, launch...)
+	if err := m.run(args...); err != nil {
+		return nil, err
+	}
+	s := m.Adopt(name)
+	if err := s.Resize(cols, rows); err != nil {
+		return nil, err
+	}
+	return s, nil
+}
+
 func (m *Manager) Adopt(name string) *Session {
 	return &Session{m: m, name: name, stop: make(chan struct{})}
 }
 
-// Session is one hosted program: a tmux session polled for screen changes.
+// Session is one hosted program.
 type Session struct {
 	m    *Manager
 	name string
@@ -192,315 +263,28 @@ type Session struct {
 	mu       sync.Mutex
 	last     string
 	cbs      []func()
+	gone     func()
 	stop     chan struct{}
+	stopOnce sync.Once
 	start    sync.Once
-	gone     func() // called once when the session is confirmed to no longer exist
-	goneOnce sync.Once
-	copyMode bool // pane is in tmux copy-mode (viewer is scrolled back through history)
 }
 
-// Spawn launches argv in a fresh tmux session sized cols x rows, with env (a
-// list of KEY=VALUE) present in the program's environment. Env is applied by
-// exec'ing the program through `env`, which is both portable and inherited by
-// every child process in the session.
-func (m *Manager) Spawn(name string, argv, env []string, cols, rows int) (*Session, error) {
-	if len(argv) == 0 {
-		return nil, fmt.Errorf("terminal: empty command")
-	}
-	if cols <= 0 {
-		cols = 200
-	}
-	if rows <= 0 {
-		rows = 50
-	}
-	launch := argv
-	if len(env) > 0 {
-		launch = append(append([]string{"env"}, env...), argv...)
-	}
-	args := []string{"new-session", "-d", "-s", name,
-		"-x", strconv.Itoa(cols), "-y", strconv.Itoa(rows)}
-	args = append(args, launch...)
-	var stderr bytes.Buffer
-	cmd := m.tmux(args...)
-	cmd.Stderr = &stderr
-	if err := cmd.Run(); err != nil {
-		return nil, fmt.Errorf("terminal: spawn %q: %w: %s", name, err, stderr.String())
-	}
-	return &Session{m: m, name: name, stop: make(chan struct{})}, nil
-}
+func (s *Session) Name() string { return s.name }
 
-// Snapshot returns the last polled screen contents.
+func (s *Session) target() string { return "=" + s.name + ":" }
+
 func (s *Session) Snapshot() string {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	return s.last
 }
 
-func (s *Session) capture() (string, error) {
-	var out, stderr bytes.Buffer
-	cmd := s.m.tmux("capture-pane", "-t", s.name, "-p")
-	cmd.Stdout = &out
-	cmd.Stderr = &stderr
-	if err := cmd.Run(); err != nil {
-		return "", fmt.Errorf("terminal: capture %q: %w: %s", s.name, err, stderr.String())
-	}
-	return out.String(), nil
-}
-
-// CaptureANSI returns the pane's current content WITH its SGR color/attribute escapes intact (`-e`),
-// so a synthetic redraw handed to a second viewer looks exactly like what a real attach would have
-// painted, colors included. Unlike a real tmux attach, this carries no leading clear-screen sequence
-// and no trailing cursor positioning — a caller that wants those (see CursorPosition) adds them.
-func (s *Session) CaptureANSI() (string, error) {
-	var out, stderr bytes.Buffer
-	cmd := s.m.tmux("capture-pane", "-t", s.name, "-e", "-p")
-	cmd.Stdout = &out
-	cmd.Stderr = &stderr
-	if err := cmd.Run(); err != nil {
-		return "", fmt.Errorf("terminal: capture(ansi) %q: %w: %s", s.name, err, stderr.String())
-	}
-	return out.String(), nil
-}
-
-// CursorPosition returns the pane's current cursor column and row, both 0-indexed (tmux's own
-// convention for #{cursor_x}/#{cursor_y}), so a synthetic redraw can place the cursor where a real
-// attach would have left it instead of wherever capture-pane's last printed line happens to end.
-func (s *Session) CursorPosition() (col, row int, err error) {
-	var out, stderr bytes.Buffer
-	cmd := s.m.tmux("display-message", "-t", s.name, "-p", "-F", "#{cursor_x} #{cursor_y}")
-	cmd.Stdout = &out
-	cmd.Stderr = &stderr
-	if runErr := cmd.Run(); runErr != nil {
-		return 0, 0, fmt.Errorf("terminal: cursor position %q: %w: %s", s.name, runErr, stderr.String())
-	}
-	fields := strings.Fields(strings.TrimSpace(out.String()))
-	if len(fields) != 2 {
-		return 0, 0, fmt.Errorf("terminal: cursor position %q: unexpected output %q", s.name, out.String())
-	}
-	if col, err = strconv.Atoi(fields[0]); err != nil {
-		return 0, 0, fmt.Errorf("terminal: cursor position %q: %w", s.name, err)
-	}
-	if row, err = strconv.Atoi(fields[1]); err != nil {
-		return 0, 0, fmt.Errorf("terminal: cursor position %q: %w", s.name, err)
-	}
-	return col, row, nil
-}
-
-// OnGone registers fn, called at most once, when this session is confirmed to be
-// gone — its tmux session (or the whole server) died under us.
-//
-// Something has to notice. The runtime driving this session lives in the connector
-// process, not in tmux, so it outlives the session it drives: reads keep returning
-// the last screen and writes keep failing into a log, and nothing upstream is any
-// the wiser. That is how a screen whose tmux had died went on being reported as
-// alive — see T-066. The poller below is already asking tmux a question every
-// 400ms, so it is the cheapest place to hear the answer "that session is gone".
 func (s *Session) OnGone(fn func()) {
 	s.mu.Lock()
 	s.gone = fn
 	s.mu.Unlock()
 }
 
-// Attach opens a real tmux client for this session inside a pty sized exactly to
-// the viewer, and streams that client's output to onData. Because it is a true
-// terminal client — not a reconstruction — the bytes carry correct wrapping,
-// height, cursor position and a full repaint on connect. tmux's window follows
-// the client's size (window-size latest), so the program renders at exactly the
-// viewer's dimensions: what the viewer sees IS the real terminal.
-func (s *Session) Attach(cols, rows int, onData func([]byte)) (*Client, error) {
-	if cols <= 0 {
-		cols = 80
-	}
-	if rows <= 0 {
-		rows = 24
-	}
-	cmd := exec.Command(s.m.bin, "-S", s.m.sock, "-f", s.m.conf, "attach-session", "-t", s.name)
-	cmd.Env = append(os.Environ(), "LC_ALL=C.UTF-8", "LANG=C.UTF-8", "TERM=xterm-256color")
-	ptmx, err := pty.StartWithSize(cmd, &pty.Winsize{Cols: uint16(cols), Rows: uint16(rows)})
-	if err != nil {
-		return nil, fmt.Errorf("terminal: attach %q: %w", s.name, err)
-	}
-	c := &Client{ptmx: ptmx, cmd: cmd}
-	go func() {
-		buf := make([]byte, 8192)
-		for {
-			n, err := ptmx.Read(buf)
-			if n > 0 {
-				chunk := make([]byte, n)
-				copy(chunk, buf[:n])
-				onData(chunk)
-			}
-			if err != nil {
-				return
-			}
-		}
-	}()
-	return c, nil
-}
-
-// Client is one attached viewer: a tmux client process on its own pty.
-type Client struct {
-	ptmx *os.File
-	cmd  *exec.Cmd
-	once sync.Once
-}
-
-// Write sends raw viewer keystrokes to the client's pty (hence to the program).
-func (c *Client) Write(p []byte) error {
-	_, err := c.ptmx.Write(p)
-	return err
-}
-
-// Resize changes the viewer's pty size; tmux resizes the window to match and the
-// program repaints — no synthetic repaint needed.
-func (c *Client) Resize(cols, rows int) error {
-	if cols <= 0 || rows <= 0 {
-		return nil
-	}
-	return pty.Setsize(c.ptmx, &pty.Winsize{Cols: uint16(cols), Rows: uint16(rows)})
-}
-
-// Close detaches this viewer (the session itself stays alive for reattachment).
-func (c *Client) Close() {
-	c.once.Do(func() {
-		_ = c.ptmx.Close()
-		if c.cmd.Process != nil {
-			_ = c.cmd.Process.Kill()
-		}
-		_ = c.cmd.Wait()
-	})
-}
-
-// ScrollUp drives the pane's tmux scrollback UP by `lines`, entering copy-mode
-// first if it is not already scrolled. The hosted program is a full-screen TUI
-// with no scrollback of its own — the history lives in tmux, reached via
-// copy-mode — so paging back is done here, never by sending PgUp/PgDn to the
-// program (which the program ignores). Idempotent: re-entering copy-mode keeps
-// the current scroll position.
-func (s *Session) ScrollUp(lines int) {
-	if lines <= 0 {
-		lines = 1
-	}
-	s.mu.Lock()
-	enter := !s.copyMode
-	s.copyMode = true
-	s.mu.Unlock()
-	if enter {
-		_ = s.m.tmux("copy-mode", "-t", s.name).Run()
-	}
-	_ = s.m.tmux("send-keys", "-t", s.name, "-X", "-N", strconv.Itoa(lines), "scroll-up").Run()
-}
-
-// ScrollDown drives the scrollback back DOWN by `lines`. It is a no-op when the
-// pane is already live (not in copy-mode). When the scroll reaches the live
-// bottom it leaves copy-mode so the view resumes following new output — so a
-// viewer simply scrolling down to the end returns to the live screen with no
-// explicit "back to live" action.
-func (s *Session) ScrollDown(lines int) {
-	if lines <= 0 {
-		lines = 1
-	}
-	s.mu.Lock()
-	inCopy := s.copyMode
-	s.mu.Unlock()
-	if !inCopy {
-		return
-	}
-	_ = s.m.tmux("send-keys", "-t", s.name, "-X", "-N", strconv.Itoa(lines), "scroll-down").Run()
-	if s.atBottom() {
-		s.ExitCopyMode()
-	}
-}
-
-// atBottom reports whether copy-mode is scrolled to (or past) the live bottom.
-// tmux's #{scroll_position} is the number of lines above the bottom (empty when
-// not in copy-mode), so 0 / empty means "showing the live screen".
-func (s *Session) atBottom() bool {
-	var out bytes.Buffer
-	cmd := s.m.tmux("display-message", "-p", "-t", s.name, "-F", "#{scroll_position}")
-	cmd.Stdout = &out
-	if cmd.Run() != nil {
-		return false
-	}
-	str := strings.TrimSpace(out.String())
-	if str == "" {
-		return true
-	}
-	n, err := strconv.Atoi(str)
-	return err == nil && n <= 0
-}
-
-// ExitCopyMode leaves tmux copy-mode, snapping the pane back to the live bottom.
-// Safe to call when not in copy-mode. Called on any input to the program, when a
-// viewer detaches, and on an explicit "back to live" scroll request, so copy-mode
-// is always a transient view state the next real interaction dismisses.
-func (s *Session) ExitCopyMode() {
-	s.mu.Lock()
-	if !s.copyMode {
-		s.mu.Unlock()
-		return
-	}
-	s.copyMode = false
-	s.mu.Unlock()
-	_ = s.m.tmux("send-keys", "-t", s.name, "-X", "cancel").Run()
-}
-
-// Write sends raw bytes to the session as literal input (used by the hosted
-// script; viewer keystrokes go through a Client's pty instead). Any input to the
-// program first leaves copy-mode, so a queued driver command (or the driver's own
-// snap-to-bottom) is delivered to the live program, never swallowed by a scroll view.
-// writeChunk is how much of a write goes into one `send-keys`. tmux rejects a command whose
-// arguments are too long ("command too long") well before this is a lot of data, so a long message
-// has to arrive in pieces. Kept comfortably under any tmux build's limit — the cost of a smaller
-// value is one more subprocess per few kilobytes, which is nothing next to losing the message.
-const writeChunk = 4096
-
-func (s *Session) Write(p []byte) error {
-	if len(p) == 0 {
-		return nil
-	}
-	s.ExitCopyMode()
-	// One write becomes as many send-keys as it takes. Sending the whole thing in one command is
-	// what silently dropped long messages to agents (T-058): tmux refused the command, the error
-	// reached only the connector's log, and the agent never heard what a person had said to it.
-	//
-	// The pieces arrive in order, so a bracketed paste stays intact — its start marker is in the
-	// first piece and its end marker in the last, and everything between is content the TUI ingests
-	// as one paste, exactly as if it had come in a single write.
-	for len(p) > 0 {
-		n := chunkEnd(p, writeChunk)
-		var stderr bytes.Buffer
-		cmd := s.m.tmux("send-keys", "-t", s.name, "-l", "--", string(p[:n]))
-		cmd.Stderr = &stderr
-		if err := cmd.Run(); err != nil {
-			return fmt.Errorf("terminal: write %q: %w: %s", s.name, err, stderr.String())
-		}
-		p = p[n:]
-	}
-	return nil
-}
-
-// chunkEnd returns how many bytes of p to send next: at most max, and never splitting a UTF-8
-// sequence. A half-delivered rune is not a cosmetic problem — the two halves are separate arguments
-// to separate tmux commands, and neither is valid text — and any Chinese message long enough to be
-// chunked would hit it.
-func chunkEnd(p []byte, max int) int {
-	if len(p) <= max {
-		return len(p)
-	}
-	n := max
-	// Back off to the start of the rune that straddles the boundary. A UTF-8 continuation byte is
-	// 10xxxxxx; at most three of them precede their leading byte.
-	for n > 0 && p[n]&0xC0 == 0x80 {
-		n--
-	}
-	if n == 0 { // not valid UTF-8 at all: send the raw bytes rather than stall
-		return max
-	}
-	return n
-}
-
-// OnChange registers fn and starts the poller on first use.
 func (s *Session) OnChange(fn func()) {
 	s.mu.Lock()
 	s.cbs = append(s.cbs, fn)
@@ -508,58 +292,94 @@ func (s *Session) OnChange(fn func()) {
 	s.start.Do(func() { go s.poll() })
 }
 
+// writeChunk bounds one send-keys: tmux rejects a command whose arguments are too long.
+const writeChunk = 4096
+
+func (s *Session) Write(p []byte) error {
+	for len(p) > 0 {
+		n := chunkEnd(p, writeChunk)
+		// copy-mode -q leaves any mode first, so the bytes reach the program rather than a
+		// scrolled-back view; both commands run in one tmux invocation.
+		err := s.m.run("copy-mode", "-q", "-t", s.target(), ";", "send-keys", "-t", s.target(), "-l", "--", string(p[:n]))
+		if err != nil {
+			return err
+		}
+		p = p[n:]
+	}
+	return nil
+}
+
+// chunkEnd returns how many bytes of p to send next: at most max, never splitting a UTF-8 sequence,
+// because each chunk is a separate tmux argument and half a rune is not valid text.
+func chunkEnd(p []byte, max int) int {
+	if len(p) <= max {
+		return len(p)
+	}
+	n := max
+	for n > 0 && p[n]&0xC0 == 0x80 {
+		n--
+	}
+	if n == 0 {
+		return max
+	}
+	return n
+}
+
+func (s *Session) LeaveMode() error { return s.m.run("copy-mode", "-q", "-t", s.target()) }
+
+func (s *Session) Resize(cols, rows int) error {
+	if cols <= 0 || rows <= 0 {
+		return fmt.Errorf("terminal: resize %s: size %dx%d", s.name, cols, rows)
+	}
+	return s.m.run("resize-window", "-t", s.target(), "-x", strconv.Itoa(cols), "-y", strconv.Itoa(rows))
+}
+
+func (s *Session) Text(history int) (string, error) {
+	return s.m.output("capture-pane", "-t", s.target(), "-p", "-J", "-S", strconv.Itoa(-history))
+}
+
 func (s *Session) poll() {
 	ticker := time.NewTicker(400 * time.Millisecond)
 	defer ticker.Stop()
-	ticks := 0
-	for {
+	for ticks := 1; ; ticks++ {
 		select {
 		case <-s.stop:
 			return
 		case <-ticker.C:
-			ticks++
-			cur, err := s.capture()
-			if err != nil {
-				// A failed capture is not proof: tmux can be momentarily busy. Ask the
-				// question that has a definite answer, and only then declare the session
-				// dead — once, after which polling a session that no longer exists is
-				// pointless.
-				if s.m.HasSession(s.name) {
-					continue
-				}
-				s.mu.Lock()
-				fn := s.gone
-				s.mu.Unlock()
-				s.goneOnce.Do(func() {
-					if fn != nil {
-						fn()
-					}
-				})
-				return
+		}
+		cur, err := s.m.output("capture-pane", "-t", s.target(), "-p")
+		if err != nil {
+			if !absent(err) {
+				fmt.Fprintf(os.Stderr, "%s: screen %s: %v\n", brand.Current.Name, s.name, err)
+				continue
 			}
 			s.mu.Lock()
-			changed := cur != s.last
-			s.last = cur
-			cbs := append([]func(){}, s.cbs...)
+			fn := s.gone
 			s.mu.Unlock()
-			// Fire on change, plus a periodic heartbeat (~every 1.2s) so a hosted
-			// script can act on and retry against a *static* screen — e.g. an
-			// unattended prompt waiting for a keypress that nothing else will emit.
-			if changed || ticks%3 == 0 {
-				for _, cb := range cbs {
-					cb()
-				}
+			if fn != nil {
+				fn()
+			}
+			return
+		}
+		s.mu.Lock()
+		changed := cur != s.last
+		s.last = cur
+		cbs := append([]func(){}, s.cbs...)
+		s.mu.Unlock()
+		if changed || ticks%3 == 0 {
+			for _, cb := range cbs {
+				cb()
 			}
 		}
 	}
 }
 
-// Close kills the session and stops its poller.
+func (s *Session) Stop() { s.stopOnce.Do(func() { close(s.stop) }) }
+
 func (s *Session) Close() error {
-	select {
-	case <-s.stop:
-	default:
-		close(s.stop)
+	s.Stop()
+	if err := s.m.run("kill-session", "-t", "="+s.name); err != nil && !absent(err) {
+		return err
 	}
-	return s.m.tmux("kill-session", "-t", s.name).Run()
+	return nil
 }
